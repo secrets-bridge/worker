@@ -66,7 +66,6 @@ type Scheduler struct {
 	tasks    []TaskRegistration
 	skipLock bool // testing knob; not exposed via public API
 	mu       sync.Mutex
-	stopped  bool
 
 	// Metrics
 	runs   *prometheus.CounterVec // labels: task, outcome

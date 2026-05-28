@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -39,8 +40,8 @@ type Server struct {
 func New(addr string, registry *prometheus.Registry) *Server {
 	if registry == nil {
 		registry = prometheus.NewRegistry()
-		registry.MustRegister(prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
-		registry.MustRegister(prometheus.NewGoCollector())
+		registry.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+		registry.MustRegister(collectors.NewGoCollector())
 	}
 	return &Server{
 		addr:     addr,

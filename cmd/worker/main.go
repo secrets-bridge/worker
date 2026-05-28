@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 
 	"github.com/secrets-bridge/api/pkg/runtime"
 	"github.com/secrets-bridge/api/pkg/storage"
@@ -81,7 +82,7 @@ func main() {
 		logger.Error("runtime open", "error", err)
 		os.Exit(1)
 	}
-	defer rt.Close()
+	defer func() { _ = rt.Close() }()
 
 	// Parse the discover-targets env var early so a misconfig surfaces
 	// at boot, not three sweeper-intervals later.
@@ -104,8 +105,8 @@ func main() {
 
 	// Register sweepers.
 	registry := prometheus.NewRegistry()
-	registry.MustRegister(prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
-	registry.MustRegister(prometheus.NewGoCollector())
+	registry.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	registry.MustRegister(collectors.NewGoCollector())
 	sched := scheduler.New(rt, logger, registry)
 
 	wrapRepo := storage.NewSecretWraps(pool)
