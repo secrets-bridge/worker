@@ -1,0 +1,95 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Worker depends on api via a `replace` directive while the polyrepo
+# refactor is ongoing. Each job checks out both repos side-by-side so
+# the replace target resolves locally.
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: worker }
+      - uses: actions/checkout@v4
+        with: { repository: secrets-bridge/api, path: api }
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.25" }
+      - name: build + vet
+        working-directory: worker
+        run: |
+          go build ./...
+          go vet ./...
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: secrets_bridge
+          POSTGRES_PASSWORD: devpass
+          POSTGRES_DB: secrets_bridge
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U secrets_bridge"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: worker }
+      - uses: actions/checkout@v4
+        with: { repository: secrets-bridge/api, path: api }
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.25" }
+      - name: test -race
+        working-directory: worker
+        env:
+          TEST_DATABASE_URL: postgres://secrets_bridge:devpass@localhost:5432/secrets_bridge?sslmode=disable
+          TEST_REDIS_URL: redis://localhost:6379/1
+        run: go test -race -count=1 ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: worker }
+      - uses: actions/checkout@v4
+        with: { repository: secrets-bridge/api, path: api }
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.25" }
+      - uses: golangci/golangci-lint-action@v7
+        with:
+          version: latest
+          working-directory: worker
+
+  tidy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: worker }
+      - uses: actions/checkout@v4
+        with: { repository: secrets-bridge/api, path: api }
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.25" }
+      - name: go mod tidy
+        working-directory: worker
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
