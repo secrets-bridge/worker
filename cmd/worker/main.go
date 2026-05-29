@@ -156,7 +156,7 @@ func main() {
 	// have SB_GITOPS_ENABLED=true. When disabled, the gitops_observations
 	// table is never read.
 	if cfg.GitOpsEnabled {
-		km, err := keymgmt.FromEnv(bootCtx)
+		km, err := keymgmt.FromEnv(bootCtx, cfg.Env)
 		if err != nil {
 			logger.Error("gitops poller: KeyManager init failed", "error", err)
 			os.Exit(1)
