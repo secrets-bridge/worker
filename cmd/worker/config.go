@@ -33,6 +33,18 @@ type Config struct {
 	// Notifications.
 	WebhookURL        string
 	WebhookSlackFormat bool
+
+	// GitOps observation poller (BRD §26). Opt-in via
+	// SB_WORKER_GITOPS_ENABLED=true so disabled deployments don't
+	// register the sweeper and don't even open the argocd_endpoints
+	// repo. When the api side has SB_GITOPS_ENABLED=false the worker
+	// MUST also be off — otherwise the poller would scan a table that
+	// will never receive rows.
+	GitOpsEnabled        bool
+	GitOpsPollInterval   time.Duration // default 15s during active rollout
+	GitOpsTimeoutInterval time.Duration // default 1m for the timeout sweeper
+	GitOpsBatchSize      int            // observations per tick; default 20
+	GitOpsHTTPTimeout    time.Duration  // per-ArgoCD-call ceiling; default 15s
 }
 
 // loadConfig reads the env vars and applies defaults. Returns an
@@ -49,6 +61,10 @@ func loadConfig() (Config, error) {
 		DiscoverInterval:         1 * time.Hour,
 		SecretsStaleAfter:        24 * time.Hour,
 		AgentsStaleAfter:         5 * time.Minute,
+		GitOpsPollInterval:       15 * time.Second,
+		GitOpsTimeoutInterval:    1 * time.Minute,
+		GitOpsBatchSize:          20,
+		GitOpsHTTPTimeout:        15 * time.Second,
 	}
 
 	if v := os.Getenv("SB_WORKER_LOCAL_ADDR"); v != "" {
@@ -66,6 +82,9 @@ func loadConfig() (Config, error) {
 		{"SB_WORKER_DISCOVER_INTERVAL", &cfg.DiscoverInterval},
 		{"SB_WORKER_SECRETS_STALE_AFTER", &cfg.SecretsStaleAfter},
 		{"SB_WORKER_AGENTS_STALE_AFTER", &cfg.AgentsStaleAfter},
+		{"SB_WORKER_GITOPS_POLL_INTERVAL", &cfg.GitOpsPollInterval},
+		{"SB_WORKER_GITOPS_TIMEOUT_INTERVAL", &cfg.GitOpsTimeoutInterval},
+		{"SB_WORKER_GITOPS_HTTP_TIMEOUT", &cfg.GitOpsHTTPTimeout},
 	} {
 		if v := os.Getenv(b.env); v != "" {
 			d, err := time.ParseDuration(v)
@@ -83,6 +102,20 @@ func loadConfig() (Config, error) {
 			return Config{}, fmt.Errorf("config: SB_WORKER_WEBHOOK_SLACK_FORMAT: %w", err)
 		}
 		cfg.WebhookSlackFormat = b
+	}
+	if v := os.Getenv("SB_WORKER_GITOPS_ENABLED"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("config: SB_WORKER_GITOPS_ENABLED: %w", err)
+		}
+		cfg.GitOpsEnabled = b
+	}
+	if v := os.Getenv("SB_WORKER_GITOPS_BATCH_SIZE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("config: SB_WORKER_GITOPS_BATCH_SIZE: %w", err)
+		}
+		cfg.GitOpsBatchSize = n
 	}
 	return cfg, nil
 }

@@ -28,6 +28,8 @@ The worker imports `github.com/secrets-bridge/api/pkg/{storage,runtime}` per the
 | `agents-stale` | Flip agents from `active` to `stale` when heartbeat has stopped | 1m | 5m |
 | `jobs-recovery` | Flip claimed sync_jobs to `expired` when claim_expires_at passed | 30s | — |
 | `discover-scheduler` | Enqueue one discover job per configured target every interval | 1h | — |
+| `gitops-poller` | Poll ArgoCD per active observation, record observed_state, transition terminal states (applied / failed) | 15s | — (opt-in via `SB_WORKER_GITOPS_ENABLED`) |
+| `gitops-timeout` | Flip rows past `timeout_at` to `applied_unverified` | 1m | — (opt-in via `SB_WORKER_GITOPS_ENABLED`) |
 
 Each sweeper:
 - Runs under a Redis lock (`worker:sweeper:<name>`) — multiple replicas mean only one runs per tick.
@@ -53,6 +55,11 @@ Each sweeper:
 | `SB_DISCOVER_TARGETS_JSON` | (unset) | Discover scheduler targets — see below |
 | `SB_WORKER_WEBHOOK_URL` | (unset) | If set, notifications go to this URL |
 | `SB_WORKER_WEBHOOK_SLACK_FORMAT` | `false` | Use Slack's `{"text": ...}` shape |
+| `SB_WORKER_GITOPS_ENABLED` | `false` | Opt-in for the GitOps observation poller + timeout sweeper (BRD §26). Must match api's `SB_GITOPS_ENABLED`. When enabled, requires a configured `KeyManager` (`SB_KMS_BACKEND` etc.) to unwrap stored ArgoCD tokens. |
+| `SB_WORKER_GITOPS_POLL_INTERVAL` | `15s` | Tick cadence of the gitops-poller sweeper |
+| `SB_WORKER_GITOPS_TIMEOUT_INTERVAL` | `1m` | Tick cadence of the gitops-timeout sweeper |
+| `SB_WORKER_GITOPS_BATCH_SIZE` | `20` | Max observations claimed per gitops-poller tick |
+| `SB_WORKER_GITOPS_HTTP_TIMEOUT` | `15s` | Per-ArgoCD-call HTTP timeout |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 
 ## Discover targets
