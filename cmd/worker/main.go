@@ -26,6 +26,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 
+	"github.com/google/uuid"
+
+	"github.com/secrets-bridge/api/pkg/keymgmt"
 	"github.com/secrets-bridge/api/pkg/runtime"
 	"github.com/secrets-bridge/api/pkg/storage"
 
@@ -147,6 +150,50 @@ func main() {
 		Interval: cfg.JobsRecoveryInterval,
 		Retry:    retry.DefaultPolicy(),
 	})
+
+	// GitOps observation poller (BRD §26). OFF by default — must be
+	// opt-in via SB_WORKER_GITOPS_ENABLED=true AND the api side must
+	// have SB_GITOPS_ENABLED=true. When disabled, the gitops_observations
+	// table is never read.
+	if cfg.GitOpsEnabled {
+		km, err := keymgmt.FromEnv(bootCtx)
+		if err != nil {
+			logger.Error("gitops poller: KeyManager init failed", "error", err)
+			os.Exit(1)
+		}
+		obsRepo := storage.NewGitOpsObservations(pool)
+		endpointRepo := storage.NewArgoCDEndpoints(pool)
+		sched.Register(scheduler.TaskRegistration{
+			Task: sweepers.GitOpsPoller{
+				Observations:  obsRepo,
+				Endpoints:     endpointRepo,
+				ResolveToken:  sweepers.BuildTokenResolver(km),
+				ClientFactory: sweepers.BuildArgoClient,
+				Notifier:      notifier,
+				BatchSize:     cfg.GitOpsBatchSize,
+				HTTPTimeout:   cfg.GitOpsHTTPTimeout,
+				ReplicaID:     uuid.New(),
+			},
+			Interval: cfg.GitOpsPollInterval,
+			Retry:    retry.DefaultPolicy(),
+		})
+		sched.Register(scheduler.TaskRegistration{
+			Task: sweepers.GitOpsTimeoutSweeper{
+				Repo:     obsRepo,
+				Notifier: notifier,
+			},
+			Interval: cfg.GitOpsTimeoutInterval,
+			Retry:    retry.DefaultPolicy(),
+		})
+		logger.Info("gitops observation poller enabled (BRD §26)",
+			"poll_interval", cfg.GitOpsPollInterval,
+			"timeout_interval", cfg.GitOpsTimeoutInterval,
+			"batch_size", cfg.GitOpsBatchSize,
+			"kms_key_id", km.CurrentKeyID(),
+		)
+	} else {
+		logger.Info("gitops observation poller disabled (set SB_WORKER_GITOPS_ENABLED=true to enable)")
+	}
 	if len(targets) > 0 {
 		sched.Register(scheduler.TaskRegistration{
 			Task: sweepers.DiscoverScheduler{
