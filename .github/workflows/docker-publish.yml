@@ -15,12 +15,15 @@ name: docker-publish
 # a pinned `vMAJOR.MINOR.PATCH` for reproducibility or `latest` for
 # rolling stable.
 #
-# This repo's go.mod declares `replace github.com/secrets-bridge/api
-# => ../api` for local polyrepo dev. For the docker build, the api
-# source is staged INSIDE the worker context under `.deps/api/` and
-# the replace path is rewritten to `./.deps/api` so the Dockerfile's
-# `COPY . .` brings both worker and api into the build stage. Removed
-# again when the api module gets a real semver tag.
+# This repo's `go.mod` declares `replace github.com/secrets-bridge/api
+# => ../api` for local polyrepo dev. The Dockerfile runs
+# `go mod download` BEFORE `COPY . .` for build-cache layering, which
+# means any in-context staging of `../api` wouldn't exist at that
+# layer anyway. The cleanest path is to STRIP the local replace
+# directive in CI before `docker build`; goproxy then resolves
+# `github.com/secrets-bridge/api` via the pseudo-version already
+# pinned in `go.sum`. `main`'s go.mod keeps the `../api` form so
+# local dev keeps working.
 #
 # Multi-arch (linux/amd64 + linux/arm64). First-build cold-cache run
 # on a GitHub-hosted runner takes ~15-25 min with QEMU; subsequent
@@ -45,32 +48,30 @@ jobs:
     name: build + push
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout worker
-        uses: actions/checkout@v4
-        with:
-          path: worker
+      - uses: actions/checkout@v4
 
-      - name: Checkout api (the replace-directive source)
-        uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
-          repository: secrets-bridge/api
-          path: api-source
+          go-version: "1.25"
 
-      - name: Stage api source under worker/.deps/api
+      - name: Drop local replace + bump api pin to main
         run: |
-          # The docker build context is `worker/`. Anything the
-          # Dockerfile's `COPY . .` needs must live inside it. We move
-          # the api source under `worker/.deps/api/` and rewrite the
-          # replace directive so it resolves inside the build stage.
-          mkdir -p worker/.deps
-          mv api-source worker/.deps/api
-          cd worker
-          # Replace the local-dev path (../api) with the in-context path.
-          # The rewrite happens on a checkout copy — no commit to the
-          # source tree; only the published image sees it.
-          sed -i 's|replace github.com/secrets-bridge/api => ../api|replace github.com/secrets-bridge/api => ./.deps/api|' go.mod
-          echo "--- go.mod replace lines after rewrite ---"
-          grep -E '^replace' go.mod
+          # `go.mod` carries `replace github.com/secrets-bridge/api =>
+          # ../api` for local polyrepo dev. For the docker build we
+          # strip the replace AND bump the pinned version to the
+          # current api/main HEAD so goproxy resolves a pseudo-version
+          # that matches what main expects (e.g. the SB_ENV gate
+          # added in api#41 needs api's keymgmt.FromEnv signature).
+          #
+          # When the api module gets a real semver tag, swap this for
+          # `go get github.com/secrets-bridge/api@vX.Y.Z` and pin in
+          # go.mod permanently.
+          go mod edit -dropreplace github.com/secrets-bridge/api
+          go get github.com/secrets-bridge/api@main
+          go mod tidy
+          echo "--- go.mod after edit ---"
+          grep -E '^(require|replace)' go.mod | head
+          grep 'secrets-bridge/api' go.mod || true
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -108,8 +109,8 @@ jobs:
       - name: Build + push
         uses: docker/build-push-action@v6
         with:
-          context: ./worker
-          file: ./worker/Dockerfile
+          context: .
+          file: ./Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
