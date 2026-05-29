@@ -11,9 +11,24 @@ import (
 // safe default — the worker boots with `docker compose up` and only
 // SB_DISCOVER_TARGETS_JSON / webhook URL need touching for
 // non-trivial setups.
+// Deployment mode. Mirrors the api repo's SB_ENV — production is the
+// safe default. Worker only consults it to forward into
+// keymgmt.FromEnv when the GitOps poller initializes its KeyManager;
+// the rest of the worker is unaffected by mode today.
+const (
+	ModeDev        = "dev"
+	ModeProduction = "production"
+)
+
 type Config struct {
 	LocalAddr      string
 	ShutdownGrace  time.Duration
+
+	// Env is the deployment mode (SB_ENV). Recognised: "dev" or
+	// "production"; default "production" so a missing/forgotten env
+	// fails closed against LocalKMS in the api-shared keymgmt
+	// resolver.
+	Env string
 
 	// Sweep cadences. Defaults err on the side of "won't spam your
 	// audit log" — operators tighten them as the deployment scales.
@@ -54,6 +69,7 @@ func loadConfig() (Config, error) {
 	cfg := Config{
 		LocalAddr:                "127.0.0.1:8091",
 		ShutdownGrace:            15 * time.Second,
+		Env:                      ModeProduction,
 		WrapsExpiredInterval:     1 * time.Minute,
 		SecretsStaleInterval:     5 * time.Minute,
 		AgentsStaleInterval:      1 * time.Minute,
@@ -69,6 +85,14 @@ func loadConfig() (Config, error) {
 
 	if v := os.Getenv("SB_WORKER_LOCAL_ADDR"); v != "" {
 		cfg.LocalAddr = v
+	}
+	if v := os.Getenv("SB_ENV"); v != "" {
+		switch v {
+		case ModeDev, ModeProduction:
+			cfg.Env = v
+		default:
+			return Config{}, fmt.Errorf("config: SB_ENV=%q is not recognised (allowed: %s, %s)", v, ModeDev, ModeProduction)
+		}
 	}
 	for _, b := range []struct {
 		env string
