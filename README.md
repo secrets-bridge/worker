@@ -127,4 +127,11 @@ go run ./cmd/worker
 - No secret values logged, audited, or notified
 - Worker authenticates to Postgres + Redis only — no provider SDKs imported
 
-🚧 Step 11 of the REFACTOR_PLAN. See [issue #1](https://github.com/secrets-bridge/worker/issues/1).
+## Status
+
+| Slice | Scope | Status |
+|---|---|---|
+| Step 11 ([#1](https://github.com/secrets-bridge/worker/issues/1)) | Scaffold + retry + notifications + scheduler + 5 sweepers (wraps-expired / secrets-stale / agents-stale / jobs-recovery / discover-scheduler) | ✅ merged |
+| BRD §26 GitOps poller ([#3](https://github.com/secrets-bridge/worker/pull/3)) | `gitops-poller` (15 s) + `gitops-timeout` (1 m) sweepers; opt-in via `SB_WORKER_GITOPS_ENABLED=true`, must match api's `SB_GITOPS_ENABLED` | ✅ merged |
+
+See [`skills/PROGRESS.md`](https://github.com/secrets-bridge/skills/blob/main/PROGRESS.md) for the slice-by-slice log.
