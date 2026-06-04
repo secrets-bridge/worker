@@ -32,11 +32,12 @@ type Config struct {
 
 	// Sweep cadences. Defaults err on the side of "won't spam your
 	// audit log" — operators tighten them as the deployment scales.
-	WrapsExpiredInterval     time.Duration
-	SecretsStaleInterval     time.Duration
-	AgentsStaleInterval      time.Duration
-	JobsRecoveryInterval     time.Duration
-	DiscoverInterval         time.Duration
+	WrapsExpiredInterval         time.Duration
+	SecretsStaleInterval         time.Duration
+	AgentsStaleInterval          time.Duration
+	JobsRecoveryInterval         time.Duration
+	DiscoverInterval             time.Duration
+	RevealSessionsExpiredInterval time.Duration
 
 	// Cutoffs: how old a row must be before a sweeper flags it.
 	SecretsStaleAfter time.Duration
@@ -70,13 +71,19 @@ func loadConfig() (Config, error) {
 		LocalAddr:                "127.0.0.1:8091",
 		ShutdownGrace:            15 * time.Second,
 		Env:                      ModeProduction,
-		WrapsExpiredInterval:     1 * time.Minute,
-		SecretsStaleInterval:     5 * time.Minute,
-		AgentsStaleInterval:      1 * time.Minute,
-		JobsRecoveryInterval:     30 * time.Second,
-		DiscoverInterval:         1 * time.Hour,
-		SecretsStaleAfter:        24 * time.Hour,
-		AgentsStaleAfter:         5 * time.Minute,
+		WrapsExpiredInterval:         1 * time.Minute,
+		SecretsStaleInterval:         5 * time.Minute,
+		AgentsStaleInterval:          1 * time.Minute,
+		JobsRecoveryInterval:         30 * time.Second,
+		DiscoverInterval:             1 * time.Hour,
+		// Reveal sessions are user-facing — a session ending late means
+		// a wrap could still be retrievable after the SPA already nuked
+		// its plaintext display. 5s keeps the gap close to invisible
+		// without thrashing Postgres (the SweepExpired query is a
+		// single indexed UPDATE … RETURNING).
+		RevealSessionsExpiredInterval: 5 * time.Second,
+		SecretsStaleAfter:             24 * time.Hour,
+		AgentsStaleAfter:              5 * time.Minute,
 		GitOpsPollInterval:       15 * time.Second,
 		GitOpsTimeoutInterval:    1 * time.Minute,
 		GitOpsBatchSize:          20,
@@ -104,6 +111,7 @@ func loadConfig() (Config, error) {
 		{"SB_WORKER_AGENTS_STALE_INTERVAL", &cfg.AgentsStaleInterval},
 		{"SB_WORKER_JOBS_RECOVERY_INTERVAL", &cfg.JobsRecoveryInterval},
 		{"SB_WORKER_DISCOVER_INTERVAL", &cfg.DiscoverInterval},
+		{"SB_WORKER_REVEAL_SESSIONS_EXPIRED_INTERVAL", &cfg.RevealSessionsExpiredInterval},
 		{"SB_WORKER_SECRETS_STALE_AFTER", &cfg.SecretsStaleAfter},
 		{"SB_WORKER_AGENTS_STALE_AFTER", &cfg.AgentsStaleAfter},
 		{"SB_WORKER_GITOPS_POLL_INTERVAL", &cfg.GitOpsPollInterval},
