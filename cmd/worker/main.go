@@ -150,6 +150,20 @@ func main() {
 		Interval: cfg.JobsRecoveryInterval,
 		Retry:    retry.DefaultPolicy(),
 	})
+	// Slice M3 — reveal sessions expired sweeper. Closes the session
+	// window for any reveal_sessions row past TTL by advancing the
+	// underlying wraps' expires_at so a post-expire retrieve returns
+	// ErrExpired even if the SPA still holds the wrap_id.
+	revealSessionRepo := storage.NewRevealSessions(pool)
+	sched.Register(scheduler.TaskRegistration{
+		Task: sweepers.RevealSessionsExpired{
+			Sessions: revealSessionRepo,
+			Wraps:    wrapRepo,
+			Notifier: notifier,
+		},
+		Interval: cfg.RevealSessionsExpiredInterval,
+		Retry:    retry.DefaultPolicy(),
+	})
 
 	// GitOps observation poller (BRD §26). OFF by default — must be
 	// opt-in via SB_WORKER_GITOPS_ENABLED=true AND the api side must
