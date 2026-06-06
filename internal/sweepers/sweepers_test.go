@@ -3,13 +3,17 @@ package sweepers_test
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/secrets-bridge/api/pkg/runtime"
 	"github.com/secrets-bridge/api/pkg/storage"
 	"github.com/secrets-bridge/worker/internal/notifications"
 	"github.com/secrets-bridge/worker/internal/sweepers"
@@ -207,13 +211,18 @@ func TestJobsRecovery_RunsExpectedSQL(t *testing.T) {
 
 // --- DiscoverScheduler ---------------------------------------------
 
-func TestDiscoverScheduler_EnqueuesOnePerTarget(t *testing.T) {
+// TestDiscoverScheduler_EnvFallback_Enqueues exercises the deprecated
+// env-var path. Reached when no DB connections repo is wired (or
+// when DB returns zero rows + env is set).
+func TestDiscoverScheduler_EnvFallback_Enqueues(t *testing.T) {
 	jc := &fakeJobCreator{}
 	notif := &recordingNotifier{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	sw := sweepers.DiscoverScheduler{
 		Jobs:     jc,
 		Notifier: notif,
-		Targets: []sweepers.DiscoverTarget{
+		Logger:   logger,
+		EnvFallback: []sweepers.DiscoverTarget{
 			{Name: "prod-vault", Cluster: "prod-eu", ProviderType: "vault"},
 			{Name: "prod-aws", Cluster: "prod-us", ProviderType: "aws-sm",
 				ProviderConfig: map[string]any{"region": "us-east-1"}},
@@ -225,14 +234,146 @@ func TestDiscoverScheduler_EnqueuesOnePerTarget(t *testing.T) {
 	if len(jc.created) != 2 {
 		t.Fatalf("created = %d want 2", len(jc.created))
 	}
-	if jc.created[0].JobType != "discover" {
+	if jc.created[0].JobType != storage.JobTypeDiscover {
 		t.Fatalf("first job type = %v", jc.created[0].JobType)
 	}
 	if jc.created[0].AgentScope["cluster_name"] != "prod-eu" {
 		t.Fatalf("first scope cluster = %v", jc.created[0].AgentScope["cluster_name"])
 	}
-	if jc.created[1].Payload["target_provider_type"] != "aws-sm" {
-		t.Fatalf("second payload type = %v", jc.created[1].Payload["target_provider_type"])
+}
+
+// TestDiscoverScheduler_DBTakesPrecedence_OverEnv pins the load-bearing
+// contract: when DB has rows AND env_fallback is non-empty, the DB
+// path runs and the env path is skipped entirely.
+func TestDiscoverScheduler_DBTakesPrecedence_OverEnv(t *testing.T) {
+	jc := &fakeJobCreator{}
+	notif := &recordingNotifier{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	dbID := uuid.New()
+	conn := &fakeProviderConnections{targets: []storage.DiscoverTarget{
+		{ID: dbID, Name: "db-vault", Type: "vault", ClusterName: "prod-db",
+			DiscoverIntervalSeconds: 600,
+			Scope:                   map[string]string{"address": "https://vault.example.com"}},
+	}}
+	locks := &fakeLocker{}
+	sw := sweepers.DiscoverScheduler{
+		Jobs:        jc,
+		Connections: conn,
+		Locks:       locks,
+		Notifier:    notif,
+		Logger:      logger,
+		EnvFallback: []sweepers.DiscoverTarget{
+			{Name: "env-vault", Cluster: "env-c", ProviderType: "vault"},
+		},
+	}
+	if err := sw.Run(t.Context()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(jc.created) != 1 {
+		t.Fatalf("created = %d want 1 (DB only — env must be ignored)", len(jc.created))
+	}
+	got := jc.created[0]
+	if got.Payload["connection_id"] != dbID.String() {
+		t.Fatalf("payload.connection_id = %v want %v", got.Payload["connection_id"], dbID)
+	}
+	if conn.markedStarted != 1 {
+		t.Fatalf("MarkDiscoverStarted calls = %d want 1", conn.markedStarted)
+	}
+	if locks.acquired != 1 {
+		t.Fatalf("lock acquires = %d want 1", locks.acquired)
+	}
+}
+
+// TestDiscoverScheduler_PerTargetLock_SkipsHeldRow proves multi-replica
+// safety: when the lock is already held for a target, that target is
+// silently skipped — no MarkStarted, no Create, no error returned.
+func TestDiscoverScheduler_PerTargetLock_SkipsHeldRow(t *testing.T) {
+	jc := &fakeJobCreator{}
+	notif := &recordingNotifier{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	conn := &fakeProviderConnections{targets: []storage.DiscoverTarget{
+		{ID: uuid.New(), Name: "held", Type: "vault", ClusterName: "c1",
+			DiscoverIntervalSeconds: 60},
+	}}
+	locks := &fakeLocker{forceHeld: true}
+	sw := sweepers.DiscoverScheduler{
+		Jobs:        jc,
+		Connections: conn,
+		Locks:       locks,
+		Notifier:    notif,
+		Logger:      logger,
+	}
+	if err := sw.Run(t.Context()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(jc.created) != 0 {
+		t.Fatalf("expected no enqueues on locked target, got %d", len(jc.created))
+	}
+	if conn.markedStarted != 0 {
+		t.Fatalf("expected no MarkDiscoverStarted on locked target, got %d", conn.markedStarted)
+	}
+}
+
+// TestDiscoverScheduler_EnqueueFailure_RollsBack proves the rollback
+// path: when Create fails, MarkDiscoverFinished is called with status
+// failure so admin UIs don't show "running" forever.
+func TestDiscoverScheduler_EnqueueFailure_RollsBack(t *testing.T) {
+	jc := &flakyJobCreator{failOn: 1} // first Create fails
+	notif := &recordingNotifier{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	id := uuid.New()
+	conn := &fakeProviderConnections{targets: []storage.DiscoverTarget{
+		{ID: id, Name: "rollback-target", Type: "vault", ClusterName: "c1",
+			DiscoverIntervalSeconds: 60},
+	}}
+	locks := &fakeLocker{}
+	sw := sweepers.DiscoverScheduler{
+		Jobs:        jc,
+		Connections: conn,
+		Locks:       locks,
+		Notifier:    notif,
+		Logger:      logger,
+	}
+	err := sw.Run(t.Context())
+	if err == nil {
+		t.Fatal("expected an error from failed enqueue")
+	}
+	if conn.markedStarted != 1 {
+		t.Fatalf("MarkDiscoverStarted = %d want 1", conn.markedStarted)
+	}
+	if conn.markedFinished != 1 {
+		t.Fatalf("MarkDiscoverFinished = %d want 1 (rollback)", conn.markedFinished)
+	}
+	if conn.lastFinishStatus != storage.DiscoverStatusFailure {
+		t.Fatalf("rollback status = %q want failure", conn.lastFinishStatus)
+	}
+	if conn.lastFinishErr == "" {
+		t.Fatal("rollback should have written a sanitized error")
+	}
+}
+
+// TestDiscoverScheduler_DBError_NotifiesAndReturns pins behaviour when
+// ListDueForDiscovery fails — the scheduler reports an error
+// notification and returns the underlying error.
+func TestDiscoverScheduler_DBError_NotifiesAndReturns(t *testing.T) {
+	jc := &fakeJobCreator{}
+	notif := &recordingNotifier{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	conn := &fakeProviderConnections{listErr: errors.New("postgres unavailable")}
+	locks := &fakeLocker{}
+	sw := sweepers.DiscoverScheduler{
+		Jobs:        jc,
+		Connections: conn,
+		Locks:       locks,
+		Notifier:    notif,
+		Logger:      logger,
+	}
+	err := sw.Run(t.Context())
+	if err == nil {
+		t.Fatal("expected error from DB list failure")
+	}
+	if len(jc.created) != 0 {
+		t.Fatal("no jobs should enqueue when DB list fails")
 	}
 }
 
@@ -260,15 +401,17 @@ func TestDiscoverScheduler_ParseTargets(t *testing.T) {
 	})
 }
 
-func TestDiscoverScheduler_PartialFailure(t *testing.T) {
+func TestDiscoverScheduler_EnvFallback_PartialFailure(t *testing.T) {
 	// First Create succeeds, second fails. The sweeper must return
 	// the error but ALSO have enqueued the one that worked.
 	failing := &flakyJobCreator{failOn: 2}
 	notif := &recordingNotifier{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	sw := sweepers.DiscoverScheduler{
 		Jobs:     failing,
 		Notifier: notif,
-		Targets: []sweepers.DiscoverTarget{
+		Logger:   logger,
+		EnvFallback: []sweepers.DiscoverTarget{
 			{Name: "good", Cluster: "c", ProviderType: "vault"},
 			{Name: "bad", Cluster: "c", ProviderType: "vault"},
 		},
@@ -280,6 +423,47 @@ func TestDiscoverScheduler_PartialFailure(t *testing.T) {
 	if failing.success != 1 {
 		t.Fatalf("expected 1 enqueued, got %d", failing.success)
 	}
+}
+
+// ---- P4 fakes -----------------------------------------------------
+
+type fakeProviderConnections struct {
+	targets          []storage.DiscoverTarget
+	listErr          error
+	markedStarted    int
+	markedFinished   int
+	lastFinishStatus string
+	lastFinishErr    string
+}
+
+func (f *fakeProviderConnections) ListDueForDiscovery(_ context.Context, _ time.Time) ([]storage.DiscoverTarget, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	return f.targets, nil
+}
+func (f *fakeProviderConnections) MarkDiscoverStarted(_ context.Context, _ uuid.UUID, _ time.Time) error {
+	f.markedStarted++
+	return nil
+}
+func (f *fakeProviderConnections) MarkDiscoverFinished(_ context.Context, _ uuid.UUID, status, sanitizedErr string, _ time.Time) error {
+	f.markedFinished++
+	f.lastFinishStatus = status
+	f.lastFinishErr = sanitizedErr
+	return nil
+}
+
+type fakeLocker struct {
+	acquired  int
+	forceHeld bool
+}
+
+func (f *fakeLocker) AcquireLock(_ context.Context, _ string, _ time.Duration) (*runtime.Lock, error) {
+	if f.forceHeld {
+		return nil, runtime.ErrLockHeld
+	}
+	f.acquired++
+	return &runtime.Lock{}, nil
 }
 
 type flakyJobCreator struct {
