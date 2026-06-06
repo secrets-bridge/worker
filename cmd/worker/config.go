@@ -37,7 +37,8 @@ type Config struct {
 	AgentsStaleInterval          time.Duration
 	JobsRecoveryInterval         time.Duration
 	DiscoverInterval             time.Duration
-	RevealSessionsExpiredInterval time.Duration
+	RevealSessionsExpiredInterval     time.Duration
+	CrossTeamFillExpiredInterval      time.Duration
 
 	// Cutoffs: how old a row must be before a sweeper flags it.
 	SecretsStaleAfter time.Duration
@@ -82,6 +83,12 @@ func loadConfig() (Config, error) {
 		// without thrashing Postgres (the SweepExpired query is a
 		// single indexed UPDATE … RETURNING).
 		RevealSessionsExpiredInterval: 5 * time.Second,
+		// fill_ttl_seconds is measured in hours (workflow default
+		// 24h); 30s precision is comfortable + matches the natural
+		// cadence of non-user-facing sweepers. The api service-layer
+		// Fill check rejects late writers anyway via
+		// ErrFillWindowExpired, so this sweeper is defense in depth.
+		CrossTeamFillExpiredInterval: 30 * time.Second,
 		SecretsStaleAfter:             24 * time.Hour,
 		AgentsStaleAfter:              5 * time.Minute,
 		GitOpsPollInterval:       15 * time.Second,
@@ -112,6 +119,7 @@ func loadConfig() (Config, error) {
 		{"SB_WORKER_JOBS_RECOVERY_INTERVAL", &cfg.JobsRecoveryInterval},
 		{"SB_WORKER_DISCOVER_INTERVAL", &cfg.DiscoverInterval},
 		{"SB_WORKER_REVEAL_SESSIONS_EXPIRED_INTERVAL", &cfg.RevealSessionsExpiredInterval},
+		{"SB_WORKER_CROSS_TEAM_FILL_EXPIRED_INTERVAL", &cfg.CrossTeamFillExpiredInterval},
 		{"SB_WORKER_SECRETS_STALE_AFTER", &cfg.SecretsStaleAfter},
 		{"SB_WORKER_AGENTS_STALE_AFTER", &cfg.AgentsStaleAfter},
 		{"SB_WORKER_GITOPS_POLL_INTERVAL", &cfg.GitOpsPollInterval},
