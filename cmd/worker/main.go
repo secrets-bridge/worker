@@ -223,20 +223,25 @@ func main() {
 	} else {
 		logger.Info("gitops observation poller disabled (set SB_WORKER_GITOPS_ENABLED=true to enable)")
 	}
-	if len(targets) > 0 {
-		sched.Register(scheduler.TaskRegistration{
-			Task: sweepers.DiscoverScheduler{
-				Jobs:     jobRepo,
-				Targets:  targets,
-				Notifier: notifier,
-			},
-			Interval: cfg.DiscoverInterval,
-			Retry:    retry.DefaultPolicy(),
-		})
-		logger.Info("discover scheduler configured", "targets", len(targets))
-	} else {
-		logger.Info("no SB_DISCOVER_TARGETS_JSON configured — discover scheduler disabled")
-	}
+	// Slice P4: DB-backed discover scheduler. Reads from
+	// provider_connections via api/pkg/storage; the env-var path
+	// (SB_DISCOVER_TARGETS_JSON) is now a deprecated fallback used
+	// ONLY when the DB returns zero rows.
+	pcRepo := storage.NewProviderConnections(pool)
+	sched.Register(scheduler.TaskRegistration{
+		Task: sweepers.DiscoverScheduler{
+			Jobs:        jobRepo,
+			Connections: pcRepo,
+			Locks:       rt,
+			EnvFallback: targets,
+			Notifier:    notifier,
+			Logger:      logger,
+		},
+		Interval: cfg.DiscoverInterval,
+		Retry:    retry.DefaultPolicy(),
+	})
+	logger.Info("discover scheduler configured (DB-backed)",
+		"env_fallback_targets", len(targets))
 
 	// Probes.
 	probeSrv := probes.New(cfg.LocalAddr, registry)
