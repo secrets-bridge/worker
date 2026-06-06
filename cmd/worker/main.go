@@ -165,6 +165,21 @@ func main() {
 		Retry:    retry.DefaultPolicy(),
 	})
 
+	// Slice N4 — cross-team fill-window expiry sweeper. Flips
+	// pending_values cross_team requests past fill_expires_at to
+	// 'expired'. Defense in depth (the api Fill check already rejects
+	// late writers); ensures observable state catches up quickly even
+	// when no fill attempt arrives.
+	accessRequestRepo := storage.NewAccessRequests(pool)
+	sched.Register(scheduler.TaskRegistration{
+		Task: sweepers.CrossTeamFillExpired{
+			Repo:     accessRequestRepo,
+			Notifier: notifier,
+		},
+		Interval: cfg.CrossTeamFillExpiredInterval,
+		Retry:    retry.DefaultPolicy(),
+	})
+
 	// GitOps observation poller (BRD §26). OFF by default — must be
 	// opt-in via SB_WORKER_GITOPS_ENABLED=true AND the api side must
 	// have SB_GITOPS_ENABLED=true. When disabled, the gitops_observations
