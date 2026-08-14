@@ -13,7 +13,7 @@
 
 Background workers for the secrets-bridge Control Plane. Runs alongside the api as a separate K8s Deployment. Owns the periodic sweepers (expired wraps, stale agents, stuck jobs, stale discovered secrets) and the discover-job scheduler.
 
-Multiple replicas can run concurrently — Redis-backed locks ensure each sweep fires from exactly one replica per tick.
+Multiple replicas can run concurrently. Redis-backed locks ensure each sweep fires from exactly one replica per tick.
 
 ## Layout
 
@@ -34,16 +34,16 @@ The worker imports `github.com/secrets-bridge/api/pkg/{storage,runtime}` per the
 
 | Sweeper | Owns | Default cadence | Default cutoff |
 |---|---|---|---|
-| `wraps-expired` | Purge `secret_wraps` rows past `expires_at` | 1m | — |
+| `wraps-expired` | Purge `secret_wraps` rows past `expires_at` | 1m | none |
 | `secrets-stale` | Flip discovered-secret rows to `missing` after extended absence | 5m | 24h |
 | `agents-stale` | Flip agents from `active` to `stale` when heartbeat has stopped | 1m | 5m |
-| `jobs-recovery` | Flip claimed sync_jobs to `expired` when claim_expires_at passed | 30s | — |
-| `discover-scheduler` | Enqueue one discover job per configured target every interval | 1h | — |
-| `gitops-poller` | Poll ArgoCD per active observation, record observed_state, transition terminal states (applied / failed) | 15s | — (opt-in via `SB_WORKER_GITOPS_ENABLED`) |
-| `gitops-timeout` | Flip rows past `timeout_at` to `applied_unverified` | 1m | — (opt-in via `SB_WORKER_GITOPS_ENABLED`) |
+| `jobs-recovery` | Flip claimed sync_jobs to `expired` when claim_expires_at passed | 30s | none |
+| `discover-scheduler` | Enqueue one discover job per configured target every interval | 1h | none |
+| `gitops-poller` | Poll ArgoCD per active observation, record observed_state, transition terminal states (applied / failed) | 15s | none (opt-in via `SB_WORKER_GITOPS_ENABLED`) |
+| `gitops-timeout` | Flip rows past `timeout_at` to `applied_unverified` | 1m | none (opt-in via `SB_WORKER_GITOPS_ENABLED`) |
 
 Each sweeper:
-- Runs under a Redis lock (`worker:sweeper:<name>`) — multiple replicas mean only one runs per tick.
+- Runs under a Redis lock (`worker:sweeper:<name>`), so with multiple replicas only one runs per tick.
 - Retries transient failures per `retry.DefaultPolicy()` (exponential, 20% jitter, 1h cap).
 - Emits a structured notification on every meaningful outcome.
 - NEVER logs / audits / notifies a secret value.
@@ -63,7 +63,7 @@ Each sweeper:
 | `SB_WORKER_DISCOVER_INTERVAL` | `1h` | |
 | `SB_WORKER_SECRETS_STALE_AFTER` | `24h` | Flip cutoff |
 | `SB_WORKER_AGENTS_STALE_AFTER` | `5m` | Flip cutoff |
-| `SB_DISCOVER_TARGETS_JSON` | (unset) | Discover scheduler targets — see below |
+| `SB_DISCOVER_TARGETS_JSON` | (unset) | Discover scheduler targets (see below) |
 | `SB_WORKER_WEBHOOK_URL` | (unset) | If set, notifications go to this URL |
 | `SB_WORKER_WEBHOOK_SLACK_FORMAT` | `false` | Use Slack's `{"text": ...}` shape |
 | `SB_WORKER_GITOPS_ENABLED` | `false` | Opt-in for the GitOps observation poller + timeout sweeper (BRD §26). Must match api's `SB_GITOPS_ENABLED`. When enabled, requires a configured `KeyManager` (`SB_KMS_BACKEND` etc.) to unwrap stored ArgoCD tokens. |
@@ -123,9 +123,9 @@ go run ./cmd/worker
 
 ## Hard rules
 
-- Stateless — all state lives in Postgres + Redis (NFR-08)
+- Stateless: all state lives in Postgres + Redis (NFR-08)
 - No secret values logged, audited, or notified
-- Worker authenticates to Postgres + Redis only — no provider SDKs imported
+- Worker authenticates to Postgres + Redis only; no provider SDKs imported
 
 ## Status
 
