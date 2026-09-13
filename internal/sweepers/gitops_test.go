@@ -251,6 +251,77 @@ func TestGitOpsPoller_EndpointDisabled_NoArgoCDCall(t *testing.T) {
 	}
 }
 
+// WRK-01 (security assessment 2026-09): per-resource "message" and
+// app-level "health_message" must be scrubbed before observed_state is
+// persisted — they're free text that can incidentally carry secret-
+// shaped substrings (e.g. a token embedded in a readiness probe
+// failure message).
+func TestGitOpsPoller_ScrubsMessageFields(t *testing.T) {
+	endpointID := uuid.New()
+	obs := &fakeGitOpsObsRepo{
+		claim: []*storage.GitOpsObservation{
+			{ID: uuid.New(), ArgoCDEndpointID: endpointID, ApplicationName: "x"},
+		},
+	}
+	ep := &fakeEndpointRepo{endpoint: &storage.ArgoCDEndpoint{
+		ID: endpointID, BaseURL: "https://argocd.example.com", Enabled: true,
+		TokenCiphertext: []byte("c"), TokenDataKeyCiphertext: []byte("d"), TokenNonce: []byte("n"), TokenKMSKeyID: "local:test",
+	}}
+	const awsKeyCanary = "AKIAIOSFODNN7EXAMPLE"
+	longMessage := strings.Repeat("readiness probe failed: ", 30) + "credential " + awsKeyCanary + " rejected"
+	app := &argocd.Application{
+		Name: "x", HealthStatus: "Degraded", SyncStatus: "OutOfSync",
+		HealthMessage: longMessage,
+		Resources: []argocd.ApplicationResource{
+			{Kind: "Pod", Name: "x-0", Health: "Degraded", Message: longMessage},
+		},
+	}
+	p := sweepers.GitOpsPoller{
+		Observations:  obs,
+		Endpoints:     ep,
+		ResolveToken:  func(_ context.Context, _ *storage.ArgoCDEndpoint) ([]byte, error) { return []byte("fake-token"), nil },
+		ClientFactory: func(context.Context, *storage.ArgoCDEndpoint, []byte, time.Duration) (sweepers.ArgoClient, error) {
+			return &fakeArgoClient{app: app}, nil
+		},
+	}
+	if err := p.Run(t.Context()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(obs.recordCalls) != 1 {
+		t.Fatalf("recordCalls = %d want 1", len(obs.recordCalls))
+	}
+	observed := obs.recordCalls[0].observed
+
+	healthMessage, _ := observed["health_message"].(string)
+	if strings.Contains(healthMessage, awsKeyCanary) {
+		t.Fatalf("health_message leaked credential: %q", healthMessage)
+	}
+	if len(healthMessage) > 280 {
+		t.Fatalf("health_message not truncated: len=%d", len(healthMessage))
+	}
+
+	resources, ok := observed["resources"].([]map[string]any)
+	if !ok || len(resources) != 1 {
+		t.Fatalf("resources = %+v", observed["resources"])
+	}
+	resourceMessage, _ := resources[0]["message"].(string)
+	if strings.Contains(resourceMessage, awsKeyCanary) {
+		t.Fatalf("resource message leaked credential: %q", resourceMessage)
+	}
+	if len(resourceMessage) > 280 {
+		t.Fatalf("resource message not truncated: len=%d", len(resourceMessage))
+	}
+
+	// Non-sensitive, non-oversized fields must still pass through
+	// untouched — this is a scrub of the message fields only.
+	if observed["health_status"] != "Degraded" {
+		t.Fatalf("health_status = %+v", observed["health_status"])
+	}
+	if resources[0]["kind"] != "Pod" || resources[0]["health"] != "Degraded" {
+		t.Fatalf("resource fields altered: %+v", resources[0])
+	}
+}
+
 func TestGitOpsPoller_ArgoCDError_UpdatesEndpointHealth(t *testing.T) {
 	endpointID := uuid.New()
 	obs := &fakeGitOpsObsRepo{

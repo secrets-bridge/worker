@@ -12,6 +12,7 @@ import (
 
 	"github.com/secrets-bridge/api/pkg/argocd"
 	"github.com/secrets-bridge/api/pkg/keymgmt"
+	"github.com/secrets-bridge/api/pkg/sanitize"
 	"github.com/secrets-bridge/api/pkg/storage"
 	"github.com/secrets-bridge/worker/internal/notifications"
 )
@@ -205,6 +206,16 @@ func (g GitOpsPoller) pollOne(ctx context.Context, factory ArgoClientFactory, o 
 // observedStateFromApp distills an argocd.Application into the
 // metadata-only snapshot stored in observed_state. Per BRD §26.4 we
 // surface only filtered status fields — never raw manifests.
+//
+// ArgoCD-supplied free-text fields (per-resource health "message" and
+// the app-level "health_message") are free text authored by whatever
+// controller/webhook set the resource's health — they can incidentally
+// carry secret-shaped substrings (tokens embedded in a probe failure,
+// a connection string in a readiness message, etc). Both are routed
+// through sanitize.DiscoverError before persistence: it redacts
+// credential-shaped substrings, strips oversized JSON blobs, and caps
+// the result at sanitize.DiscoverMaxErrorLen. WRK-01 (security
+// assessment 2026-09).
 func observedStateFromApp(app *argocd.Application) map[string]any {
 	resources := make([]map[string]any, 0, len(app.Resources))
 	for _, r := range app.Resources {
@@ -213,12 +224,12 @@ func observedStateFromApp(app *argocd.Application) map[string]any {
 			"name":      r.Name,
 			"namespace": r.Namespace,
 			"health":    r.Health,
-			"message":   r.Message,
+			"message":   sanitize.DiscoverError(r.Message),
 		})
 	}
 	return map[string]any{
 		"health_status":   app.HealthStatus,
-		"health_message":  app.HealthMessage,
+		"health_message":  sanitize.DiscoverError(app.HealthMessage),
 		"sync_status":     app.SyncStatus,
 		"sync_revision":   app.SyncRevision,
 		"operation_phase": app.OperationPhase,
