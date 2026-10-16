@@ -42,6 +42,13 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
+# One publish per ref at a time, in push order. Without this, two merges
+# a few seconds apart race and whichever run finishes last owns :dev and
+# :main, which can be the older commit.
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   publish:
     name: build + push
@@ -56,6 +63,7 @@ jobs:
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
+          cache: false
           go-version: "1.27.x"
 
       - name: Drop local replace + bump api pin to main
