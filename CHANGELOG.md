@@ -11,6 +11,22 @@ on `main`.
 
 ## [Unreleased]
 
+### Security
+- gitops-poller no longer stores ArgoCD `message` / `health_message`
+  free text in `observed_state` (WRK-01).
+- ArgoCD bearer token is never sent to a plain `http://` endpoint
+  outside `SB_ENV=dev` (WRK-N-04).
+- reveal-sessions-expired self-heals wraps left live by a partial
+  failure, treats consumed or deleted wraps as closed and caps its
+  retries per tick (WRK-N-01).
+- Sweepers write audit events (`system:worker`) for cross-team
+  expiry, reveal session TTL, job expiry, GitOps terminal states and
+  stale agents (WRK-N-02).
+- `SB_DISCOVER_TARGETS_JSON` only runs when no DB discover target
+  exists (WRK-N-05).
+- Non-positive durations and batch size fail at boot (WRK-N-06).
+- Failed notifications are logged and counted (WRK-N-07).
+
 ### Added
 - Docker image publishing workflow — multi-arch (amd64 + arm64),
   pushed to `ghcr.io/secrets-bridge/worker`. Tags: rolling `dev` on
