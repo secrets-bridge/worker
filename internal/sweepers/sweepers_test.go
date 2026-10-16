@@ -434,6 +434,14 @@ type fakeProviderConnections struct {
 	markedFinished   int
 	lastFinishStatus string
 	lastFinishErr    string
+	hasTargets       bool
+	hasErr           error
+	hasCalls         int
+}
+
+func (f *fakeProviderConnections) HasDiscoverTargets(_ context.Context) (bool, error) {
+	f.hasCalls++
+	return f.hasTargets, f.hasErr
 }
 
 func (f *fakeProviderConnections) ListDueForDiscovery(_ context.Context, _ time.Time) ([]storage.DiscoverTarget, error) {
@@ -479,4 +487,46 @@ func (f *flakyJobCreator) Create(_ context.Context, _ *storage.SyncJob) error {
 	}
 	f.success++
 	return nil
+}
+
+// WRK-N-05: if the scheduler can't tell whether DB targets exist, it
+// fails closed and does not run the env fallback.
+func TestDiscoverScheduler_EnvFallback_FailsClosedOnExistenceError(t *testing.T) {
+	jc := &fakeJobCreator{}
+	notif := &recordingNotifier{}
+	conn := &fakeProviderConnections{hasErr: errors.New("conn closed")}
+	sw := sweepers.DiscoverScheduler{
+		Jobs:        jc,
+		Connections: conn,
+		Locks:       &fakeLocker{},
+		Notifier:    notif,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		EnvFallback: []sweepers.DiscoverTarget{{Name: "env", Cluster: "c", ProviderType: "vault"}},
+	}
+	if err := sw.Run(t.Context()); err == nil || !strings.Contains(err.Error(), "conn closed") {
+		t.Fatalf("err = %v want the existence-check error", err)
+	}
+	if len(jc.created) != 0 {
+		t.Fatalf("env fallback enqueued %d job(s) despite the failed check", len(jc.created))
+	}
+	if titles := notif.titles(); len(titles) != 1 || !strings.Contains(titles[0], "env fallback skipped") {
+		t.Fatalf("titles = %v", titles)
+	}
+}
+
+// No env fallback configured: no extra existence query per tick.
+func TestDiscoverScheduler_NoEnvFallback_SkipsExistenceQuery(t *testing.T) {
+	conn := &fakeProviderConnections{}
+	sw := sweepers.DiscoverScheduler{
+		Jobs:        &fakeJobCreator{},
+		Connections: conn,
+		Locks:       &fakeLocker{},
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	if err := sw.Run(t.Context()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if conn.hasCalls != 0 {
+		t.Fatalf("HasDiscoverTargets called %d time(s) with no env fallback", conn.hasCalls)
+	}
 }

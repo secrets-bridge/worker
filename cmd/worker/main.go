@@ -244,12 +244,12 @@ func main() {
 	// Slice P4: DB-backed discover scheduler. Reads from
 	// provider_connections via api/pkg/storage; the env-var path
 	// (SB_DISCOVER_TARGETS_JSON) is now a deprecated fallback used
-	// ONLY when the DB returns zero rows.
+	// ONLY when no DB-backed discover target exists at all.
 	pcRepo := storage.NewProviderConnections(pool)
 	sched.Register(scheduler.TaskRegistration{
 		Task: sweepers.DiscoverScheduler{
 			Jobs:        jobRepo,
-			Connections: pcRepo,
+			Connections: sweepers.DiscoverConnections{ProviderConnections: pcRepo, DB: pool},
 			Locks:       rt,
 			EnvFallback: targets,
 			Notifier:    notifier,

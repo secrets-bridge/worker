@@ -38,6 +38,47 @@ type providerConnectionScheduler interface {
 	ListDueForDiscovery(ctx context.Context, now time.Time) ([]storage.DiscoverTarget, error)
 	MarkDiscoverStarted(ctx context.Context, id uuid.UUID, now time.Time) error
 	MarkDiscoverFinished(ctx context.Context, id uuid.UUID, status, sanitizedErr string, now time.Time) error
+	// HasDiscoverTargets reports whether any DB-backed discover target
+	// exists, due or not. Gates the env fallback.
+	HasDiscoverTargets(ctx context.Context) (bool, error)
+}
+
+// DiscoverConnections is the production providerConnectionScheduler:
+// the api repository plus one worker-side existence query the api
+// doesn't export.
+type DiscoverConnections struct {
+	*storage.ProviderConnections
+	DB pgxRowQuerier
+}
+
+// hasDiscoverTargetsSQL uses the same eligibility filter as
+// ListDueForDiscovery, minus the "due now" clause: a connection the
+// scheduler would ever pick up.
+const hasDiscoverTargetsSQL = `
+	SELECT EXISTS (
+		SELECT 1 FROM provider_connections
+		WHERE status = 'active'
+		  AND discover_enabled = true
+		  AND cluster_name IS NOT NULL
+	)`
+
+// HasDiscoverTargets implements providerConnectionScheduler.
+func (c DiscoverConnections) HasDiscoverTargets(ctx context.Context) (bool, error) {
+	rows, err := c.DB.Query(ctx, hasDiscoverTargetsSQL)
+	if err != nil {
+		return false, fmt.Errorf("sweepers: check db discover targets: %w", err)
+	}
+	defer rows.Close()
+	exists := false
+	if rows.Next() {
+		if err := rows.Scan(&exists); err != nil {
+			return false, fmt.Errorf("sweepers: scan db discover targets: %w", err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("sweepers: check db discover targets: %w", err)
+	}
+	return exists, nil
 }
 
 // redisLocker is the slice of runtime.Client used for per-target
@@ -67,8 +108,9 @@ type DiscoverTarget struct {
 //     the row 'running', and enqueues the job. The api's JobService
 //     OnCompleted hook later flips the row to 'success'/'failure'.
 //  2. Env var (SB_DISCOVER_TARGETS_JSON) — fallback. Only used when
-//     the DB returns zero rows AND the env var is set. Emits a
-//     deprecation WARN per tick so operators know to migrate.
+//     no DB-backed target exists at all (not merely none due this
+//     tick) AND the env var is set. Emits a deprecation WARN per tick
+//     so operators know to migrate. WRK-N-05.
 type DiscoverScheduler struct {
 	Jobs        jobCreator
 	Connections providerConnectionScheduler
@@ -116,6 +158,26 @@ func (s DiscoverScheduler) Run(ctx context.Context) error {
 				s.logDeprecation("SB_DISCOVER_TARGETS_JSON is ignored because DB-backed discover targets exist")
 			}
 			return s.enqueueDBTargets(ctx, targets, now())
+		}
+		// Nothing due this tick. The env fallback is only for
+		// deployments with no DB targets at all; a DB target that is
+		// merely not due yet must not let it run. Fail closed if we
+		// can't tell. WRK-N-05.
+		if len(s.EnvFallback) > 0 {
+			exists, err := s.Connections.HasDiscoverTargets(ctx)
+			if err != nil {
+				notify(ctx, s.Notifier, notifications.Event{
+					Severity:  notifications.SeverityError,
+					Component: s.Name(),
+					Title:     "discover scheduler: failed to check DB targets; env fallback skipped",
+					Detail:    sanitize.DiscoverError(err.Error()),
+				})
+				return err
+			}
+			if exists {
+				s.logDeprecation("SB_DISCOVER_TARGETS_JSON is ignored because DB-backed discover targets exist")
+				return nil
+			}
 		}
 	}
 
