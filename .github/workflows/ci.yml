@@ -16,12 +16,12 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with: { path: worker }
-      - uses: actions/checkout@v4
-        with: { repository: secrets-bridge/api, path: api }
-      - uses: actions/setup-go@v5
-        with: { go-version: "1.25" }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { path: worker, persist-credentials: false }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { repository: secrets-bridge/api, path: api, persist-credentials: false }
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with: { go-version: "1.27.x" }
       - name: build + vet
         working-directory: worker
         run: |
@@ -52,12 +52,12 @@ jobs:
           --health-timeout 2s
           --health-retries 20
     steps:
-      - uses: actions/checkout@v4
-        with: { path: worker }
-      - uses: actions/checkout@v4
-        with: { repository: secrets-bridge/api, path: api }
-      - uses: actions/setup-go@v5
-        with: { go-version: "1.25" }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { path: worker, persist-credentials: false }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { repository: secrets-bridge/api, path: api, persist-credentials: false }
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with: { go-version: "1.27.x" }
       - name: test -race
         working-directory: worker
         env:
@@ -68,26 +68,26 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with: { path: worker }
-      - uses: actions/checkout@v4
-        with: { repository: secrets-bridge/api, path: api }
-      - uses: actions/setup-go@v5
-        with: { go-version: "1.25" }
-      - uses: golangci/golangci-lint-action@v7
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { path: worker, persist-credentials: false }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { repository: secrets-bridge/api, path: api, persist-credentials: false }
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with: { go-version: "1.27.x" }
+      - uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7.0.1
         with:
-          version: latest
+          version: v2.14.0
           working-directory: worker
 
   tidy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with: { path: worker }
-      - uses: actions/checkout@v4
-        with: { repository: secrets-bridge/api, path: api }
-      - uses: actions/setup-go@v5
-        with: { go-version: "1.25" }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { path: worker, persist-credentials: false }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { repository: secrets-bridge/api, path: api, persist-credentials: false }
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with: { go-version: "1.27.x" }
       - name: go mod tidy
         working-directory: worker
         run: |
