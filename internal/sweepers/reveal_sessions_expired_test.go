@@ -61,6 +61,10 @@ func (f *fakeClamper) ClampEndedSessionWraps(_ context.Context, _ time.Time) ([]
 	return f.healed, f.err
 }
 
+func (f *fakeClamper) RequestIDs(_ context.Context, _ []uuid.UUID) (map[uuid.UUID]uuid.UUID, error) {
+	return map[uuid.UUID]uuid.UUID{}, nil
+}
+
 // --- tests ---------------------------------------------------------
 
 func TestRevealSessionsExpired_HappyPath(t *testing.T) {

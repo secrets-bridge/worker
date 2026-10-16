@@ -82,3 +82,33 @@ func (s RevealSessionStore) ClampEndedSessionWraps(ctx context.Context, now time
 	}
 	return ids, nil
 }
+
+// RequestIDs maps each of the given reveal session ids to its
+// access_request_id, so a session's audit event shares the request's
+// correlation id. Sessions without a request are left out.
+func (s RevealSessionStore) RequestIDs(ctx context.Context, sessionIDs []uuid.UUID) (map[uuid.UUID]uuid.UUID, error) {
+	out := map[uuid.UUID]uuid.UUID{}
+	if len(sessionIDs) == 0 {
+		return out, nil
+	}
+	const q = `
+		SELECT id, access_request_id
+		FROM reveal_sessions
+		WHERE id = ANY($1) AND access_request_id IS NOT NULL`
+	rows, err := s.DB.Query(ctx, q, sessionIDs)
+	if err != nil {
+		return nil, fmt.Errorf("reveal session request ids: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var sid, rid uuid.UUID
+		if err := rows.Scan(&sid, &rid); err != nil {
+			return nil, fmt.Errorf("scan reveal session request id: %w", err)
+		}
+		out[sid] = rid
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reveal session request ids: %w", err)
+	}
+	return out, nil
+}

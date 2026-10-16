@@ -29,6 +29,9 @@ type fakeGitOpsObsRepo struct {
 	recordErr   error
 	transitions []transitionCall
 	transErr    error
+	// alreadyTerminal makes TransitionTerminal report "no change", as
+	// when the other sweeper finished the row first.
+	alreadyTerminal bool
 
 	// for timeout sweeper
 	findRows []*storage.GitOpsObservation
@@ -60,11 +63,14 @@ func (f *fakeGitOpsObsRepo) RecordPoll(_ context.Context, id uuid.UUID, observed
 	return f.recordErr
 }
 
-func (f *fakeGitOpsObsRepo) Transition(_ context.Context, id uuid.UUID, state storage.GitOpsObservationState, _ time.Time) error {
+func (f *fakeGitOpsObsRepo) TransitionTerminal(_ context.Context, id uuid.UUID, state storage.GitOpsObservationState, _ time.Time) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.transitions = append(f.transitions, transitionCall{id: id, state: state})
-	return f.transErr
+	if f.transErr != nil {
+		return false, f.transErr
+	}
+	return !f.alreadyTerminal, nil
 }
 
 func (f *fakeGitOpsObsRepo) FindTimedOut(_ context.Context, _ time.Time, _ int) ([]*storage.GitOpsObservation, error) {

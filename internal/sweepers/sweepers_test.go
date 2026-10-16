@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/secrets-bridge/api/pkg/runtime"
@@ -43,28 +44,38 @@ func (f *fakeStaleMarker) MarkStaleAsMissing(_ context.Context, cutoff time.Time
 	return f.flipped, f.err
 }
 
+// fakePool records the last statement and returns no rows. The
+// Postgres-backed tests in audit_pg_test.go cover real row flips.
 type fakePool struct {
-	mu          sync.Mutex
-	lastSQL     string
-	lastArgs    []any
-	rowsTouched int64
-	err         error
+	mu       sync.Mutex
+	lastSQL  string
+	lastArgs []any
+	err      error
 }
 
-func (f *fakePool) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+func (f *fakePool) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.lastSQL = sql
 	f.lastArgs = args
 	if f.err != nil {
-		return pgconn.CommandTag{}, f.err
+		return nil, f.err
 	}
-	// pgconn.CommandTag is opaque outside the package; pgconn doesn't
-	// expose a setter for RowsAffected, so the test asserts on the
-	// notification metadata rather than on the returned tag.
-	_ = f.rowsTouched
-	return pgconn.CommandTag{}, nil
+	return emptyRows{}, nil
 }
+
+// emptyRows is a pgx.Rows with no rows.
+type emptyRows struct{}
+
+func (emptyRows) Close()                                       {}
+func (emptyRows) Err() error                                   { return nil }
+func (emptyRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
+func (emptyRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
+func (emptyRows) Next() bool                                   { return false }
+func (emptyRows) Scan(...any) error                            { return errors.New("no rows") }
+func (emptyRows) Values() ([]any, error)                       { return nil, nil }
+func (emptyRows) RawValues() [][]byte                          { return nil }
+func (emptyRows) Conn() *pgx.Conn                              { return nil }
 
 type fakeJobCreator struct {
 	created []*storage.SyncJob

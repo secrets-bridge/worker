@@ -16,7 +16,7 @@ import (
 // satisfies both methods.
 type gitopsTimeoutRepo interface {
 	FindTimedOut(ctx context.Context, now time.Time, limit int) ([]*storage.GitOpsObservation, error)
-	Transition(ctx context.Context, id uuid.UUID, state storage.GitOpsObservationState, at time.Time) error
+	TransitionTerminal(ctx context.Context, id uuid.UUID, state storage.GitOpsObservationState, at time.Time) (bool, error)
 }
 
 // GitOpsTimeoutSweeper flips gitops_observations rows whose
@@ -29,7 +29,10 @@ type gitopsTimeoutRepo interface {
 // row's state is distinct from `applied` so the UI shows what
 // happened.
 type GitOpsTimeoutSweeper struct {
-	Repo     gitopsTimeoutRepo
+	Repo gitopsTimeoutRepo
+	// Audit receives one gitops.observation.applied_unverified event per
+	// row this sweeper flips (WRK-N-02).
+	Audit    auditAppender
 	Notifier notifications.Notifier
 	Limit    int
 	Now      func() time.Time
@@ -64,7 +67,8 @@ func (s GitOpsTimeoutSweeper) Run(ctx context.Context) error {
 	}
 	flipped := 0
 	for _, r := range rows {
-		if err := s.Repo.Transition(ctx, r.ID, storage.GitOpsStateAppliedUnverified, t); err != nil {
+		changed, err := s.Repo.TransitionTerminal(ctx, r.ID, storage.GitOpsStateAppliedUnverified, t)
+		if err != nil {
 			notify(ctx, s.Notifier, notifications.Event{
 				Severity:  notifications.SeverityWarn,
 				Component: s.Name(),
@@ -77,6 +81,11 @@ func (s GitOpsTimeoutSweeper) Run(ctx context.Context) error {
 			})
 			continue
 		}
+		if !changed {
+			// The poller finished it between FindTimedOut and here.
+			continue
+		}
+		auditGitOpsTransition(ctx, s.Audit, s.Name(), r, storage.GitOpsStateAppliedUnverified, "timeout")
 		flipped++
 	}
 	if flipped > 0 {

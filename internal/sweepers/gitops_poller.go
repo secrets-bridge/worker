@@ -22,7 +22,9 @@ import (
 type gitopsObservationRepo interface {
 	ClaimNextActive(ctx context.Context, limit int, claimedBy uuid.UUID) ([]*storage.GitOpsObservation, error)
 	RecordPoll(ctx context.Context, id uuid.UUID, observed map[string]any, pollErr string, polledAt time.Time) error
-	Transition(ctx context.Context, id uuid.UUID, state storage.GitOpsObservationState, at time.Time) error
+	// TransitionTerminal reports whether this call made the flip, so
+	// only real transitions are audited. See GitOpsObservationStore.
+	TransitionTerminal(ctx context.Context, id uuid.UUID, state storage.GitOpsObservationState, at time.Time) (bool, error)
 }
 
 // gitopsEndpointRepo is the slice of api/pkg/storage.ArgoCDEndpoints
@@ -84,8 +86,11 @@ type GitOpsPoller struct {
 	ResolveToken  TokenResolver // required; nil → fail loud
 	ClientFactory ArgoClientFactory
 	Notifier      notifications.Notifier
-	BatchSize     int
-	HTTPTimeout   time.Duration
+	// Audit receives one gitops.observation.<state> event per terminal
+	// flip this poller makes (WRK-N-02).
+	Audit       auditAppender
+	BatchSize   int
+	HTTPTimeout time.Duration
 	// AllowPlainHTTP lets the poller send the ArgoCD bearer token to an
 	// http:// endpoint. main sets it only when SB_ENV=dev; the zero
 	// value refuses, so production fails closed. WRK-N-04.
@@ -207,8 +212,12 @@ func (g GitOpsPoller) pollOne(ctx context.Context, factory ArgoClientFactory, o 
 	// phase=Failed. Otherwise the row stays in active.
 	state := decideTerminalState(app)
 	if state != "" {
-		if err := g.Observations.Transition(ctx, o.ID, state, now); err != nil {
+		changed, err := g.Observations.TransitionTerminal(ctx, o.ID, state, now)
+		if err != nil {
 			return fmt.Errorf("transition: %w", err)
+		}
+		if changed {
+			auditGitOpsTransition(ctx, g.Audit, g.Name(), o, state, "argocd_status")
 		}
 	}
 	return nil

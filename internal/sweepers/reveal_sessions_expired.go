@@ -30,10 +30,12 @@ type wrapExpirer interface {
 	SetExpiry(ctx context.Context, id uuid.UUID, expiresAt time.Time) error
 }
 
-// endedSessionWrapClamper is the worker-side self-heal query. The real
+// revealSessionStore is the worker-side SQL the sweeper needs: the
+// self-heal and the request lookup for audit correlation. The real
 // implementation is RevealSessionStore.
-type endedSessionWrapClamper interface {
+type revealSessionStore interface {
 	ClampEndedSessionWraps(ctx context.Context, now time.Time) ([]uuid.UUID, error)
+	RequestIDs(ctx context.Context, sessionIDs []uuid.UUID) (map[uuid.UUID]uuid.UUID, error)
 }
 
 // RevealSessionsExpired guarantees the session-level invariant: when
@@ -59,7 +61,10 @@ type RevealSessionsExpired struct {
 	Wraps    wrapExpirer
 	// Store runs the self-heal. Required; Run reports an error every
 	// tick when it is missing so a wiring mistake is loud.
-	Store    endedSessionWrapClamper
+	Store revealSessionStore
+	// Audit receives one reveal.session.expired event per swept session
+	// and one wrap.expiry_clamped event per self-healed wrap (WRK-N-02).
+	Audit    auditAppender
 	Notifier notifications.Notifier
 	// Now is injected for tests; real wiring leaves it nil.
 	Now func() time.Time
@@ -99,20 +104,26 @@ func (s RevealSessionsExpired) Run(ctx context.Context) error {
 		wrapsExpired  int
 		alreadyClosed int
 		wrapErrs      []error
+		perSession    = make([]wrapTally, len(swept))
 	)
-	for _, sess := range swept {
+	for i, sess := range swept {
 		for _, wid := range sess.WrapIDs {
 			err := s.Wraps.SetExpiry(ctx, wid, t)
 			switch {
 			case err == nil:
 				wrapsExpired++
+				perSession[i].expired++
 			case errors.Is(err, storage.ErrAlreadyConsumed), errors.Is(err, storage.ErrNotFound):
 				alreadyClosed++
+				perSession[i].closed++
 			default:
+				perSession[i].failed++
 				wrapErrs = append(wrapErrs, fmt.Errorf("session=%s wrap=%s: %w", sess.ID, wid, err))
 			}
 		}
 	}
+	runCorrelation := uuid.New()
+	s.auditSwept(ctx, swept, perSession, runCorrelation)
 
 	var (
 		healed  []uuid.UUID
@@ -122,6 +133,14 @@ func (s RevealSessionsExpired) Run(ctx context.Context) error {
 		healErr = errors.New("sweepers: reveal-sessions-expired has no Store; ended-session wraps are not self-healed")
 	} else {
 		healed, healErr = s.Store.ClampEndedSessionWraps(ctx, t)
+	}
+	for _, wid := range healed {
+		recordAudit(ctx, s.Audit, s.Name(), storage.AuditEvent{
+			Action:        "wrap.expiry_clamped",
+			Resource:      "wrap:" + wid.String(),
+			CorrelationID: runCorrelation,
+			Metadata:      map[string]any{"reason": "reveal_session_ended"},
+		})
 	}
 	if healErr != nil {
 		// Per-wrap failures are only covered once the self-heal has run,
@@ -156,4 +175,46 @@ func (s RevealSessionsExpired) Run(ctx context.Context) error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// wrapTally counts what happened to one session's wraps.
+type wrapTally struct{ expired, closed, failed int }
+
+// auditSwept writes one reveal.session.expired event per swept session,
+// correlated with its access request when it has one. A failed lookup
+// only costs the correlation, never the event.
+func (s RevealSessionsExpired) auditSwept(ctx context.Context, swept []storage.SweptRevealSession, tallies []wrapTally, runCorrelation uuid.UUID) {
+	if len(swept) == 0 {
+		return
+	}
+	requestIDs := map[uuid.UUID]uuid.UUID{}
+	if s.Store != nil {
+		ids := make([]uuid.UUID, len(swept))
+		for i, sess := range swept {
+			ids[i] = sess.ID
+		}
+		if found, err := s.Store.RequestIDs(ctx, ids); err == nil {
+			requestIDs = found
+		}
+	}
+	for i, sess := range swept {
+		md := map[string]any{
+			"reason":               string(storage.RevealSessionExpiredTTL),
+			"wrap_count":           len(sess.WrapIDs),
+			"wraps_expired":        tallies[i].expired,
+			"wraps_already_closed": tallies[i].closed,
+			"wrap_errors":          tallies[i].failed,
+		}
+		correlation := runCorrelation
+		if rid, ok := requestIDs[sess.ID]; ok {
+			correlation = rid
+			md["request_id"] = rid.String()
+		}
+		recordAudit(ctx, s.Audit, s.Name(), storage.AuditEvent{
+			Action:        "reveal.session.expired",
+			Resource:      "reveal_session:" + sess.ID.String(),
+			CorrelationID: correlation,
+			Metadata:      md,
+		})
+	}
 }

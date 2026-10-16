@@ -130,6 +130,9 @@ func main() {
 	wrapRepo := storage.NewSecretWraps(pool)
 	secretRepo := storage.NewSecrets(pool)
 	jobRepo := storage.NewSyncJobs(pool)
+	// WRK-N-02: every state flip a sweeper makes is audited as
+	// system:worker (hard rule 6).
+	auditRepo := storage.NewAuditEvents(pool)
 
 	sched.Register(scheduler.TaskRegistration{
 		Task: sweepers.WrapsExpired{
@@ -153,6 +156,7 @@ func main() {
 			Pool:       pool,
 			Notifier:   notifier,
 			StaleAfter: cfg.AgentsStaleAfter,
+			Audit:      auditRepo,
 		},
 		Interval: cfg.AgentsStaleInterval,
 		Retry:    retry.DefaultPolicy(),
@@ -161,6 +165,7 @@ func main() {
 		Task: sweepers.JobsRecovery{
 			Pool:     pool,
 			Notifier: notifier,
+			Audit:    auditRepo,
 		},
 		Interval: cfg.JobsRecoveryInterval,
 		Retry:    retry.DefaultPolicy(),
@@ -175,6 +180,7 @@ func main() {
 			Sessions: revealSessionRepo,
 			Wraps:    wrapRepo,
 			Store:    sweepers.RevealSessionStore{DB: pool},
+			Audit:    auditRepo,
 			Notifier: notifier,
 		},
 		Interval: cfg.RevealSessionsExpiredInterval,
@@ -190,6 +196,7 @@ func main() {
 	sched.Register(scheduler.TaskRegistration{
 		Task: sweepers.CrossTeamFillExpired{
 			Repo:     accessRequestRepo,
+			Audit:    auditRepo,
 			Notifier: notifier,
 		},
 		Interval: cfg.CrossTeamFillExpiredInterval,
@@ -206,7 +213,10 @@ func main() {
 			logger.Error("gitops poller: KeyManager init failed", "error", err)
 			os.Exit(1)
 		}
-		obsRepo := storage.NewGitOpsObservations(pool)
+		obsRepo := sweepers.GitOpsObservationStore{
+			GitOpsObservations: storage.NewGitOpsObservations(pool),
+			DB:                 pool,
+		}
 		endpointRepo := storage.NewArgoCDEndpoints(pool)
 		sched.Register(scheduler.TaskRegistration{
 			Task: sweepers.GitOpsPoller{
@@ -215,6 +225,7 @@ func main() {
 				ResolveToken:  sweepers.BuildTokenResolver(km),
 				ClientFactory: sweepers.BuildArgoClient,
 				Notifier:      notifier,
+				Audit:         auditRepo,
 				BatchSize:     cfg.GitOpsBatchSize,
 				HTTPTimeout:   cfg.GitOpsHTTPTimeout,
 				ReplicaID:     uuid.New(),
@@ -228,6 +239,7 @@ func main() {
 		sched.Register(scheduler.TaskRegistration{
 			Task: sweepers.GitOpsTimeoutSweeper{
 				Repo:     obsRepo,
+				Audit:    auditRepo,
 				Notifier: notifier,
 			},
 			Interval: cfg.GitOpsTimeoutInterval,

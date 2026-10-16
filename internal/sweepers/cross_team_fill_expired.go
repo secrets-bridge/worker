@@ -30,7 +30,10 @@ type crossTeamFillExpirer interface {
 // the inbox) within the configured cadence even when no fill attempt
 // arrives to trigger the service-layer rejection.
 type CrossTeamFillExpired struct {
-	Repo     crossTeamFillExpirer
+	Repo crossTeamFillExpirer
+	// Audit receives one request.cross_team.expired event per flipped
+	// request (WRK-N-02).
+	Audit    auditAppender
 	Notifier notifications.Notifier
 	// Now is injected for tests; real wiring leaves it nil.
 	Now func() time.Time
@@ -60,6 +63,14 @@ func (s CrossTeamFillExpired) Run(ctx context.Context) error {
 	}
 	if len(swept) == 0 {
 		return nil
+	}
+	for _, r := range swept {
+		recordAudit(ctx, s.Audit, s.Name(), storage.AuditEvent{
+			Action:        "request.cross_team.expired",
+			Resource:      "request:" + r.ID.String(),
+			CorrelationID: r.ID,
+			Metadata:      map[string]any{"reason": "fill_window_expired"},
+		})
 	}
 	notify(ctx, s.Notifier, notifications.Event{
 		Severity:  notifications.SeverityInfo,
