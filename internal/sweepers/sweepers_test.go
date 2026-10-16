@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/secrets-bridge/api/pkg/runtime"
 	"github.com/secrets-bridge/api/pkg/storage"
@@ -76,6 +77,10 @@ func (emptyRows) Scan(...any) error                            { return errors.N
 func (emptyRows) Values() ([]any, error)                       { return nil, nil }
 func (emptyRows) RawValues() [][]byte                          { return nil }
 func (emptyRows) Conn() *pgx.Conn                              { return nil }
+
+// TypeMap is on pgx.Rows from pgx 5.11; nil is allowed for a Rows that
+// carries no values. Harmless on older pgx, where it is just unused.
+func (emptyRows) TypeMap() *pgtype.Map { return nil }
 
 type fakeJobCreator struct {
 	created []*storage.SyncJob
