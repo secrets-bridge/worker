@@ -202,6 +202,9 @@ func main() {
 				BatchSize:     cfg.GitOpsBatchSize,
 				HTTPTimeout:   cfg.GitOpsHTTPTimeout,
 				ReplicaID:     uuid.New(),
+				// WRK-N-04: never send the ArgoCD token over plain http
+				// outside local dev.
+				AllowPlainHTTP: cfg.Env == ModeDev,
 			},
 			Interval: cfg.GitOpsPollInterval,
 			Retry:    retry.DefaultPolicy(),

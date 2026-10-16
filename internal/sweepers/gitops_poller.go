@@ -6,6 +6,7 @@ import (
 	"crypto/cipher"
 	"errors"
 	"fmt"
+	"net/url"
 	"time"
 
 	"github.com/google/uuid"
@@ -85,6 +86,10 @@ type GitOpsPoller struct {
 	Notifier      notifications.Notifier
 	BatchSize     int
 	HTTPTimeout   time.Duration
+	// AllowPlainHTTP lets the poller send the ArgoCD bearer token to an
+	// http:// endpoint. main sets it only when SB_ENV=dev; the zero
+	// value refuses, so production fails closed. WRK-N-04.
+	AllowPlainHTTP bool
 	// ReplicaID identifies this worker replica for telemetry; the
 	// observation rows don't carry a claimed_by today.
 	ReplicaID uuid.UUID
@@ -158,6 +163,13 @@ func (g GitOpsPoller) pollOne(ctx context.Context, factory ArgoClientFactory, o 
 		_ = g.Observations.RecordPoll(ctx, o.ID, nil, "endpoint disabled", now)
 		return nil // no error bubble; row stays in active for the next tick
 	}
+	// Checked before the token is unwrapped, so a refused endpoint never
+	// has its token decrypted, let alone sent in cleartext.
+	if !g.AllowPlainHTTP && !isHTTPSURL(ep.BaseURL) {
+		_ = g.Endpoints.UpdateHealth(ctx, ep.ID, now, errPlainHTTPRefused.Error())
+		_ = g.Observations.RecordPoll(ctx, o.ID, nil, errPlainHTTPRefused.Error(), now)
+		return errPlainHTTPRefused
+	}
 	if g.ResolveToken == nil {
 		_ = g.Observations.RecordPoll(ctx, o.ID, nil, "no token resolver configured", now)
 		return errors.New("no token resolver configured")
@@ -200,6 +212,21 @@ func (g GitOpsPoller) pollOne(ctx context.Context, factory ArgoClientFactory, o 
 		}
 	}
 	return nil
+}
+
+// errPlainHTTPRefused is recorded as the endpoint health error and the
+// observation poll error when a non-https endpoint is skipped. A fixed
+// string: it never carries the URL or the token.
+var errPlainHTTPRefused = errors.New("argocd endpoint refused: base_url must use https unless SB_ENV=dev")
+
+// isHTTPSURL reports whether raw parses as an absolute https URL.
+// url.Parse lowercases the scheme, so "HTTPS://" passes too.
+func isHTTPSURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	return u.Scheme == "https" && u.Host != ""
 }
 
 // observedStateFromApp distills an argocd.Application into the
