@@ -251,12 +251,11 @@ func TestGitOpsPoller_EndpointDisabled_NoArgoCDCall(t *testing.T) {
 	}
 }
 
-// WRK-01 (security assessment 2026-09): per-resource "message" and
-// app-level "health_message" must be scrubbed before observed_state is
-// persisted — they're free text that can incidentally carry secret-
-// shaped substrings (e.g. a token embedded in a readiness probe
-// failure message).
-func TestGitOpsPoller_ScrubsMessageFields(t *testing.T) {
+// WRK-01: per-resource "message" and app-level "health_message" are
+// free text that can carry secret-shaped substrings (e.g. a token in a
+// readiness probe failure). They are dropped from observed_state, not
+// scrubbed. See also TestGitOpsPoller_PG_ObservedStateHasNoMessageFields.
+func TestGitOpsPoller_DropsMessageFields(t *testing.T) {
 	endpointID := uuid.New()
 	obs := &fakeGitOpsObsRepo{
 		claim: []*storage.GitOpsObservation{
@@ -292,28 +291,23 @@ func TestGitOpsPoller_ScrubsMessageFields(t *testing.T) {
 	}
 	observed := obs.recordCalls[0].observed
 
-	healthMessage, _ := observed["health_message"].(string)
-	if strings.Contains(healthMessage, awsKeyCanary) {
-		t.Fatalf("health_message leaked credential: %q", healthMessage)
+	if _, ok := observed["health_message"]; ok {
+		t.Fatalf("observed_state still carries health_message: %+v", observed)
 	}
-	if len(healthMessage) > 280 {
-		t.Fatalf("health_message not truncated: len=%d", len(healthMessage))
-	}
-
 	resources, ok := observed["resources"].([]map[string]any)
 	if !ok || len(resources) != 1 {
 		t.Fatalf("resources = %+v", observed["resources"])
 	}
-	resourceMessage, _ := resources[0]["message"].(string)
-	if strings.Contains(resourceMessage, awsKeyCanary) {
-		t.Fatalf("resource message leaked credential: %q", resourceMessage)
+	if _, ok := resources[0]["message"]; ok {
+		t.Fatalf("resource still carries message: %+v", resources[0])
 	}
-	if len(resourceMessage) > 280 {
-		t.Fatalf("resource message not truncated: len=%d", len(resourceMessage))
+	for _, v := range resources[0] {
+		if s, _ := v.(string); strings.Contains(s, awsKeyCanary) {
+			t.Fatalf("resource leaked credential: %+v", resources[0])
+		}
 	}
 
-	// Non-sensitive, non-oversized fields must still pass through
-	// untouched — this is a scrub of the message fields only.
+	// Status fields still pass through untouched.
 	if observed["health_status"] != "Degraded" {
 		t.Fatalf("health_status = %+v", observed["health_status"])
 	}
