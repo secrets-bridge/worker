@@ -44,8 +44,9 @@ The worker imports `github.com/secrets-bridge/api/pkg/{storage,runtime}` per the
 
 Each sweeper:
 - Runs under a Redis lock (`worker:sweeper:<name>`), so with multiple replicas only one runs per tick.
-- Retries transient failures per `retry.DefaultPolicy()` (exponential, 20% jitter, 1h cap).
-- Emits a structured notification on every meaningful outcome.
+- Retries transient failures per `retry.DefaultPolicy()` (exponential, 20% jitter, 1h cap). `reveal-sessions-expired` is the exception: at most 3 tries (about 1.8s) per tick, since its self-heal redoes missed work on the next tick.
+- Writes one audit event per row it changes, as actor `system:worker`, with ids, reasons and counts only.
+- Emits a structured notification on every meaningful outcome. A notification that fails to send is logged with the sweeper name and an error class (never the error text) and counted in `worker_sweeper_notify_failures_total`.
 - NEVER logs / audits / notifies a secret value.
 
 ## Env vars
@@ -73,6 +74,10 @@ Each sweeper:
 | `SB_WORKER_GITOPS_HTTP_TIMEOUT` | `15s` | Per-ArgoCD-call HTTP timeout |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 
+Every duration above must be greater than zero and `SB_WORKER_GITOPS_BATCH_SIZE` at least 1. Anything else stops the worker at boot with an error naming the variable.
+
+ArgoCD endpoints must use `https://`. Plain `http://` is only polled when `SB_ENV=dev`; otherwise the endpoint is skipped before its token is unwrapped and a health error is recorded on it.
+
 ## Discover targets
 
 `SB_DISCOVER_TARGETS_JSON` is a JSON array. Example:
@@ -95,7 +100,7 @@ Each sweeper:
 ]
 ```
 
-`cluster` must match the target agent's `SB_CLUSTER_NAME`. A future PR will replace this env var with a `provider_connections` admin API.
+`cluster` must match the target agent's `SB_CLUSTER_NAME`. This env var is a deprecated fallback: discovery targets now live in `provider_connections`, and the env targets only run when no eligible connection exists at all (active, discovery enabled, cluster name set), not just when none is due this tick.
 
 ## Notifications
 

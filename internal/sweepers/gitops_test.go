@@ -2,9 +2,13 @@ package sweepers_test
 
 import (
 	"context"
+	"encoding/pem"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,6 +29,9 @@ type fakeGitOpsObsRepo struct {
 	recordErr   error
 	transitions []transitionCall
 	transErr    error
+	// alreadyTerminal makes TransitionTerminal report "no change", as
+	// when the other sweeper finished the row first.
+	alreadyTerminal bool
 
 	// for timeout sweeper
 	findRows []*storage.GitOpsObservation
@@ -56,11 +63,14 @@ func (f *fakeGitOpsObsRepo) RecordPoll(_ context.Context, id uuid.UUID, observed
 	return f.recordErr
 }
 
-func (f *fakeGitOpsObsRepo) Transition(_ context.Context, id uuid.UUID, state storage.GitOpsObservationState, _ time.Time) error {
+func (f *fakeGitOpsObsRepo) TransitionTerminal(_ context.Context, id uuid.UUID, state storage.GitOpsObservationState, _ time.Time) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.transitions = append(f.transitions, transitionCall{id: id, state: state})
-	return f.transErr
+	if f.transErr != nil {
+		return false, f.transErr
+	}
+	return !f.alreadyTerminal, nil
 }
 
 func (f *fakeGitOpsObsRepo) FindTimedOut(_ context.Context, _ time.Time, _ int) ([]*storage.GitOpsObservation, error) {
@@ -251,12 +261,11 @@ func TestGitOpsPoller_EndpointDisabled_NoArgoCDCall(t *testing.T) {
 	}
 }
 
-// WRK-01 (security assessment 2026-09): per-resource "message" and
-// app-level "health_message" must be scrubbed before observed_state is
-// persisted — they're free text that can incidentally carry secret-
-// shaped substrings (e.g. a token embedded in a readiness probe
-// failure message).
-func TestGitOpsPoller_ScrubsMessageFields(t *testing.T) {
+// WRK-01: per-resource "message" and app-level "health_message" are
+// free text that can carry secret-shaped substrings (e.g. a token in a
+// readiness probe failure). They are dropped from observed_state, not
+// scrubbed. See also TestGitOpsPoller_PG_ObservedStateHasNoMessageFields.
+func TestGitOpsPoller_DropsMessageFields(t *testing.T) {
 	endpointID := uuid.New()
 	obs := &fakeGitOpsObsRepo{
 		claim: []*storage.GitOpsObservation{
@@ -292,28 +301,23 @@ func TestGitOpsPoller_ScrubsMessageFields(t *testing.T) {
 	}
 	observed := obs.recordCalls[0].observed
 
-	healthMessage, _ := observed["health_message"].(string)
-	if strings.Contains(healthMessage, awsKeyCanary) {
-		t.Fatalf("health_message leaked credential: %q", healthMessage)
+	if _, ok := observed["health_message"]; ok {
+		t.Fatalf("observed_state still carries health_message: %+v", observed)
 	}
-	if len(healthMessage) > 280 {
-		t.Fatalf("health_message not truncated: len=%d", len(healthMessage))
-	}
-
 	resources, ok := observed["resources"].([]map[string]any)
 	if !ok || len(resources) != 1 {
 		t.Fatalf("resources = %+v", observed["resources"])
 	}
-	resourceMessage, _ := resources[0]["message"].(string)
-	if strings.Contains(resourceMessage, awsKeyCanary) {
-		t.Fatalf("resource message leaked credential: %q", resourceMessage)
+	if _, ok := resources[0]["message"]; ok {
+		t.Fatalf("resource still carries message: %+v", resources[0])
 	}
-	if len(resourceMessage) > 280 {
-		t.Fatalf("resource message not truncated: len=%d", len(resourceMessage))
+	for _, v := range resources[0] {
+		if s, _ := v.(string); strings.Contains(s, awsKeyCanary) {
+			t.Fatalf("resource leaked credential: %+v", resources[0])
+		}
 	}
 
-	// Non-sensitive, non-oversized fields must still pass through
-	// untouched — this is a scrub of the message fields only.
+	// Status fields still pass through untouched.
 	if observed["health_status"] != "Degraded" {
 		t.Fatalf("health_status = %+v", observed["health_status"])
 	}
@@ -391,5 +395,133 @@ func TestGitOpsTimeoutSweeper_FindError(t *testing.T) {
 	err := sw.Run(t.Context())
 	if err == nil || !strings.Contains(err.Error(), "db down") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// --- WRK-N-04: plain http ArgoCD endpoints --------------------------
+
+// argoProbe records every request that reaches the fake ArgoCD and
+// whether it carried an Authorization header.
+type argoProbe struct {
+	hits     atomic.Int32
+	authSeen atomic.Value // string
+}
+
+func (p *argoProbe) handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p.hits.Add(1)
+		if a := r.Header.Get("Authorization"); a != "" {
+			p.authSeen.Store(a)
+		}
+		http.NotFound(w, r)
+	})
+}
+
+func (p *argoProbe) auth() string {
+	s, _ := p.authSeen.Load().(string)
+	return s
+}
+
+func pollOnceAgainst(t *testing.T, ep *storage.ArgoCDEndpoint, configure func(*sweepers.GitOpsPoller)) (*fakeGitOpsObsRepo, *fakeEndpointRepo, int) {
+	t.Helper()
+	obs := &fakeGitOpsObsRepo{claim: []*storage.GitOpsObservation{
+		{ID: uuid.New(), ArgoCDEndpointID: ep.ID, ApplicationName: "billing-api"},
+	}}
+	eps := &fakeEndpointRepo{endpoint: ep}
+	resolved := 0
+	p := sweepers.GitOpsPoller{
+		Observations: obs,
+		Endpoints:    eps,
+		ResolveToken: func(context.Context, *storage.ArgoCDEndpoint) ([]byte, error) {
+			resolved++
+			return []byte("fake-token"), nil
+		},
+		// ClientFactory nil: the production argocd client does the HTTP.
+		HTTPTimeout: 5 * time.Second,
+	}
+	if configure != nil {
+		configure(&p)
+	}
+	if err := p.Run(t.Context()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	return obs, eps, resolved
+}
+
+func TestGitOpsPoller_PlainHTTPEndpointRefusedByDefault(t *testing.T) {
+	probe := &argoProbe{}
+	srv := httptest.NewServer(probe.handler())
+	t.Cleanup(srv.Close)
+
+	ep := &storage.ArgoCDEndpoint{ID: uuid.New(), BaseURL: srv.URL, Enabled: true}
+	obs, eps, resolved := pollOnceAgainst(t, ep, nil)
+
+	if n := probe.hits.Load(); n != 0 {
+		t.Fatalf("plain http endpoint got %d request(s), Authorization=%q; want none", n, probe.auth())
+	}
+	if resolved != 0 {
+		t.Fatalf("token resolved %d time(s) for a refused endpoint; want 0", resolved)
+	}
+	if !strings.Contains(eps.health, "https") {
+		t.Fatalf("endpoint health = %q want an https refusal", eps.health)
+	}
+	if len(obs.recordCalls) != 1 || !strings.Contains(obs.recordCalls[0].errMsg, "https") {
+		t.Fatalf("recordCalls = %+v want one poll error naming https", obs.recordCalls)
+	}
+	for _, s := range []string{eps.health, obs.recordCalls[0].errMsg} {
+		if strings.Contains(s, "fake-token") {
+			t.Fatalf("token leaked into a stored error: %q", s)
+		}
+	}
+	if len(obs.transitions) != 0 {
+		t.Fatalf("transitions = %+v want none", obs.transitions)
+	}
+}
+
+// Control for the test above: an https endpoint still gets polled with
+// the bearer token, so the harness does see headers when they're sent.
+func TestGitOpsPoller_HTTPSEndpointStillPolled(t *testing.T) {
+	probe := &argoProbe{}
+	srv := httptest.NewTLSServer(probe.handler())
+	t.Cleanup(srv.Close)
+
+	ep := &storage.ArgoCDEndpoint{
+		ID: uuid.New(), BaseURL: srv.URL, Enabled: true,
+		TLSCAPEM: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})),
+	}
+	_, _, resolved := pollOnceAgainst(t, ep, nil)
+	if probe.hits.Load() == 0 || probe.auth() != "Bearer fake-token" {
+		t.Fatalf("https endpoint: hits=%d auth=%q want a request with the bearer token", probe.hits.Load(), probe.auth())
+	}
+	if resolved != 1 {
+		t.Fatalf("token resolved %d time(s) want 1", resolved)
+	}
+}
+
+// SB_ENV=dev keeps the local-compose path working: main sets
+// AllowPlainHTTP only in dev.
+func TestGitOpsPoller_PlainHTTPAllowedInDev(t *testing.T) {
+	probe := &argoProbe{}
+	srv := httptest.NewServer(probe.handler())
+	t.Cleanup(srv.Close)
+
+	ep := &storage.ArgoCDEndpoint{ID: uuid.New(), BaseURL: srv.URL, Enabled: true}
+	_, _, resolved := pollOnceAgainst(t, ep, func(p *sweepers.GitOpsPoller) { p.AllowPlainHTTP = true })
+	if probe.hits.Load() == 0 || resolved != 1 {
+		t.Fatalf("dev http endpoint: hits=%d resolved=%d want it polled", probe.hits.Load(), resolved)
+	}
+}
+
+// Anything that isn't an absolute https URL is refused before the token
+// is resolved.
+func TestGitOpsPoller_NonHTTPSSchemesRefused(t *testing.T) {
+	for _, base := range []string{"ftp://argocd.example.com", "argocd.example.com", "https://", "://bad"} {
+		t.Run(base, func(t *testing.T) {
+			ep := &storage.ArgoCDEndpoint{ID: uuid.New(), BaseURL: base, Enabled: true}
+			_, eps, resolved := pollOnceAgainst(t, ep, nil)
+			if resolved != 0 || !strings.Contains(eps.health, "https") {
+				t.Fatalf("resolved=%d health=%q want refusal before token resolve", resolved, eps.health)
+			}
+		})
 	}
 }

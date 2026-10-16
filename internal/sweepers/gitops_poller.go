@@ -6,13 +6,13 @@ import (
 	"crypto/cipher"
 	"errors"
 	"fmt"
+	"net/url"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/secrets-bridge/api/pkg/argocd"
 	"github.com/secrets-bridge/api/pkg/keymgmt"
-	"github.com/secrets-bridge/api/pkg/sanitize"
 	"github.com/secrets-bridge/api/pkg/storage"
 	"github.com/secrets-bridge/worker/internal/notifications"
 )
@@ -22,7 +22,9 @@ import (
 type gitopsObservationRepo interface {
 	ClaimNextActive(ctx context.Context, limit int, claimedBy uuid.UUID) ([]*storage.GitOpsObservation, error)
 	RecordPoll(ctx context.Context, id uuid.UUID, observed map[string]any, pollErr string, polledAt time.Time) error
-	Transition(ctx context.Context, id uuid.UUID, state storage.GitOpsObservationState, at time.Time) error
+	// TransitionTerminal reports whether this call made the flip, so
+	// only real transitions are audited. See GitOpsObservationStore.
+	TransitionTerminal(ctx context.Context, id uuid.UUID, state storage.GitOpsObservationState, at time.Time) (bool, error)
 }
 
 // gitopsEndpointRepo is the slice of api/pkg/storage.ArgoCDEndpoints
@@ -84,8 +86,15 @@ type GitOpsPoller struct {
 	ResolveToken  TokenResolver // required; nil → fail loud
 	ClientFactory ArgoClientFactory
 	Notifier      notifications.Notifier
-	BatchSize     int
-	HTTPTimeout   time.Duration
+	// Audit receives one gitops.observation.<state> event per terminal
+	// flip this poller makes (WRK-N-02).
+	Audit       auditAppender
+	BatchSize   int
+	HTTPTimeout time.Duration
+	// AllowPlainHTTP lets the poller send the ArgoCD bearer token to an
+	// http:// endpoint. main sets it only when SB_ENV=dev; the zero
+	// value refuses, so production fails closed. WRK-N-04.
+	AllowPlainHTTP bool
 	// ReplicaID identifies this worker replica for telemetry; the
 	// observation rows don't carry a claimed_by today.
 	ReplicaID uuid.UUID
@@ -159,6 +168,13 @@ func (g GitOpsPoller) pollOne(ctx context.Context, factory ArgoClientFactory, o 
 		_ = g.Observations.RecordPoll(ctx, o.ID, nil, "endpoint disabled", now)
 		return nil // no error bubble; row stays in active for the next tick
 	}
+	// Checked before the token is unwrapped, so a refused endpoint never
+	// has its token decrypted, let alone sent in cleartext.
+	if !g.AllowPlainHTTP && !isHTTPSURL(ep.BaseURL) {
+		_ = g.Endpoints.UpdateHealth(ctx, ep.ID, now, errPlainHTTPRefused.Error())
+		_ = g.Observations.RecordPoll(ctx, o.ID, nil, errPlainHTTPRefused.Error(), now)
+		return errPlainHTTPRefused
+	}
 	if g.ResolveToken == nil {
 		_ = g.Observations.RecordPoll(ctx, o.ID, nil, "no token resolver configured", now)
 		return errors.New("no token resolver configured")
@@ -196,26 +212,44 @@ func (g GitOpsPoller) pollOne(ctx context.Context, factory ArgoClientFactory, o 
 	// phase=Failed. Otherwise the row stays in active.
 	state := decideTerminalState(app)
 	if state != "" {
-		if err := g.Observations.Transition(ctx, o.ID, state, now); err != nil {
+		changed, err := g.Observations.TransitionTerminal(ctx, o.ID, state, now)
+		if err != nil {
 			return fmt.Errorf("transition: %w", err)
+		}
+		if changed {
+			auditGitOpsTransition(ctx, g.Audit, g.Name(), o, state, "argocd_status")
 		}
 	}
 	return nil
+}
+
+// errPlainHTTPRefused is recorded as the endpoint health error and the
+// observation poll error when a non-https endpoint is skipped. A fixed
+// string: it never carries the URL or the token.
+var errPlainHTTPRefused = errors.New("argocd endpoint refused: base_url must use https unless SB_ENV=dev")
+
+// isHTTPSURL reports whether raw parses as an absolute https URL.
+// url.Parse lowercases the scheme, so "HTTPS://" passes too.
+func isHTTPSURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	return u.Scheme == "https" && u.Host != ""
 }
 
 // observedStateFromApp distills an argocd.Application into the
 // metadata-only snapshot stored in observed_state. Per BRD §26.4 we
 // surface only filtered status fields — never raw manifests.
 //
-// ArgoCD-supplied free-text fields (per-resource health "message" and
-// the app-level "health_message") are free text authored by whatever
-// controller/webhook set the resource's health — they can incidentally
-// carry secret-shaped substrings (tokens embedded in a probe failure,
-// a connection string in a readiness message, etc). Both are routed
-// through sanitize.DiscoverError before persistence: it redacts
-// credential-shaped substrings, strips oversized JSON blobs, and caps
-// the result at sanitize.DiscoverMaxErrorLen. WRK-01 (security
-// assessment 2026-09).
+// ArgoCD free text (per-resource health "message", app-level
+// "health_message") is NOT stored. It is written by whatever
+// controller or webhook set the health and can carry anything (a
+// connection string in a readiness failure, a token in a probe URL),
+// and observed_state is returned to requesters by
+// GET /requests/:id/gitops. A pattern scrub only catches the shapes it
+// knows, so the fields are dropped outright. WRK-01 (security
+// assessment 2026-10-16).
 func observedStateFromApp(app *argocd.Application) map[string]any {
 	resources := make([]map[string]any, 0, len(app.Resources))
 	for _, r := range app.Resources {
@@ -224,12 +258,10 @@ func observedStateFromApp(app *argocd.Application) map[string]any {
 			"name":      r.Name,
 			"namespace": r.Namespace,
 			"health":    r.Health,
-			"message":   sanitize.DiscoverError(r.Message),
 		})
 	}
 	return map[string]any{
 		"health_status":   app.HealthStatus,
-		"health_message":  sanitize.DiscoverError(app.HealthMessage),
 		"sync_status":     app.SyncStatus,
 		"sync_revision":   app.SyncRevision,
 		"operation_phase": app.OperationPhase,

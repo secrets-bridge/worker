@@ -5,6 +5,10 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
+
+	"github.com/secrets-bridge/api/pkg/storage"
+
 	"github.com/secrets-bridge/worker/internal/notifications"
 )
 
@@ -25,15 +29,26 @@ import (
 // side's ClaimNext does the work for the claim path, the worker
 // owns the explicit expiry transition.
 type JobsRecovery struct {
-	Pool      pgxQuerier
-	Notifier  notifications.Notifier
-	Now       func() time.Time
+	Pool     pgxRowQuerier
+	Notifier notifications.Notifier
+	// Audit receives one job.expired event per flipped job, under the
+	// job's own correlation id (WRK-N-02).
+	Audit auditAppender
+	Now   func() time.Time
 }
 
 // Name returns the stable identifier for this sweeper.
 func (s JobsRecovery) Name() string { return "jobs-recovery" }
 
-// Run flips expired claimed jobs and notifies with the count.
+// expiredJob is the value-free slice of a flipped sync_jobs row.
+type expiredJob struct {
+	id          uuid.UUID
+	correlation uuid.UUID
+	jobType     string
+}
+
+// Run flips expired claimed jobs, audits each flip and notifies with
+// the count. The UPDATE is unchanged apart from RETURNING.
 func (s JobsRecovery) Run(ctx context.Context) error {
 	now := time.Now
 	if s.Now != nil {
@@ -44,8 +59,9 @@ func (s JobsRecovery) Run(ctx context.Context) error {
 		SET status = 'expired'
 		WHERE status = 'claimed'
 		  AND claim_expires_at IS NOT NULL
-		  AND claim_expires_at < $1`
-	tag, err := s.Pool.Exec(ctx, q, now())
+		  AND claim_expires_at < $1
+		RETURNING id, correlation_id, job_type`
+	jobs, err := s.flip(ctx, q, now())
 	if err != nil {
 		notify(ctx, s.Notifier, notifications.Event{
 			Severity:  notifications.SeverityError,
@@ -55,15 +71,42 @@ func (s JobsRecovery) Run(ctx context.Context) error {
 		})
 		return fmt.Errorf("sweepers: recover stuck jobs: %w", err)
 	}
-	flipped := tag.RowsAffected()
-	if flipped > 0 {
+	for _, j := range jobs {
+		recordAudit(ctx, s.Audit, s.Name(), storage.AuditEvent{
+			Action:        "job.expired",
+			Resource:      "job:" + j.id.String(),
+			CorrelationID: j.correlation,
+			Metadata: map[string]any{
+				"job_type": j.jobType,
+				"reason":   "claim_expired",
+			},
+		})
+	}
+	if flipped := len(jobs); flipped > 0 {
 		notify(ctx, s.Notifier, notifications.Event{
 			Severity:  notifications.SeverityWarn,
 			Component: s.Name(),
 			Title:     "stuck jobs marked expired",
 			Detail:    "claim_expires_at past; agent likely crashed mid-execute",
-			Metadata:  map[string]any{"flipped": flipped},
+			Metadata:  map[string]any{"flipped": int64(flipped)},
 		})
 	}
 	return nil
+}
+
+func (s JobsRecovery) flip(ctx context.Context, q string, now time.Time) ([]expiredJob, error) {
+	rows, err := s.Pool.Query(ctx, q, now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []expiredJob
+	for rows.Next() {
+		var j expiredJob
+		if err := rows.Scan(&j.id, &j.correlation, &j.jobType); err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
 }

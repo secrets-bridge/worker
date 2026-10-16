@@ -43,6 +43,20 @@ import (
 // buildVersion is set at link time.
 var buildVersion = "dev"
 
+// revealSessionsRetry bounds the retries inside one reveal-sessions
+// tick (worst case about 1.8s of backoff). The sweeper ticks every few
+// seconds and its self-heal redoes missed work on the next tick, while
+// DefaultPolicy's growing backoff (up to 1h per wait, over an hour in
+// total) would keep the sweeper lock and stall every later sweep after
+// a database blip. WRK-N-01.
+func revealSessionsRetry() retry.Policy {
+	return retry.Policy{
+		InitialDelay: 500 * time.Millisecond,
+		MaxDelay:     time.Second,
+		MaxAttempts:  3,
+	}
+}
+
 func main() {
 	cfg, err := loadConfig()
 	if err != nil {
@@ -110,11 +124,15 @@ func main() {
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	registry.MustRegister(collectors.NewGoCollector())
+	registry.MustRegister(sweepers.Collectors()...)
 	sched := scheduler.New(rt, logger, registry)
 
 	wrapRepo := storage.NewSecretWraps(pool)
 	secretRepo := storage.NewSecrets(pool)
 	jobRepo := storage.NewSyncJobs(pool)
+	// WRK-N-02: every state flip a sweeper makes is audited as
+	// system:worker (hard rule 6).
+	auditRepo := storage.NewAuditEvents(pool)
 
 	sched.Register(scheduler.TaskRegistration{
 		Task: sweepers.WrapsExpired{
@@ -138,6 +156,7 @@ func main() {
 			Pool:       pool,
 			Notifier:   notifier,
 			StaleAfter: cfg.AgentsStaleAfter,
+			Audit:      auditRepo,
 		},
 		Interval: cfg.AgentsStaleInterval,
 		Retry:    retry.DefaultPolicy(),
@@ -146,6 +165,7 @@ func main() {
 		Task: sweepers.JobsRecovery{
 			Pool:     pool,
 			Notifier: notifier,
+			Audit:    auditRepo,
 		},
 		Interval: cfg.JobsRecoveryInterval,
 		Retry:    retry.DefaultPolicy(),
@@ -159,10 +179,12 @@ func main() {
 		Task: sweepers.RevealSessionsExpired{
 			Sessions: revealSessionRepo,
 			Wraps:    wrapRepo,
+			Store:    sweepers.RevealSessionStore{DB: pool},
+			Audit:    auditRepo,
 			Notifier: notifier,
 		},
 		Interval: cfg.RevealSessionsExpiredInterval,
-		Retry:    retry.DefaultPolicy(),
+		Retry:    revealSessionsRetry(),
 	})
 
 	// Slice N4 — cross-team fill-window expiry sweeper. Flips
@@ -174,6 +196,7 @@ func main() {
 	sched.Register(scheduler.TaskRegistration{
 		Task: sweepers.CrossTeamFillExpired{
 			Repo:     accessRequestRepo,
+			Audit:    auditRepo,
 			Notifier: notifier,
 		},
 		Interval: cfg.CrossTeamFillExpiredInterval,
@@ -190,7 +213,10 @@ func main() {
 			logger.Error("gitops poller: KeyManager init failed", "error", err)
 			os.Exit(1)
 		}
-		obsRepo := storage.NewGitOpsObservations(pool)
+		obsRepo := sweepers.GitOpsObservationStore{
+			GitOpsObservations: storage.NewGitOpsObservations(pool),
+			DB:                 pool,
+		}
 		endpointRepo := storage.NewArgoCDEndpoints(pool)
 		sched.Register(scheduler.TaskRegistration{
 			Task: sweepers.GitOpsPoller{
@@ -199,9 +225,13 @@ func main() {
 				ResolveToken:  sweepers.BuildTokenResolver(km),
 				ClientFactory: sweepers.BuildArgoClient,
 				Notifier:      notifier,
+				Audit:         auditRepo,
 				BatchSize:     cfg.GitOpsBatchSize,
 				HTTPTimeout:   cfg.GitOpsHTTPTimeout,
 				ReplicaID:     uuid.New(),
+				// WRK-N-04: never send the ArgoCD token over plain http
+				// outside local dev.
+				AllowPlainHTTP: cfg.Env == ModeDev,
 			},
 			Interval: cfg.GitOpsPollInterval,
 			Retry:    retry.DefaultPolicy(),
@@ -209,6 +239,7 @@ func main() {
 		sched.Register(scheduler.TaskRegistration{
 			Task: sweepers.GitOpsTimeoutSweeper{
 				Repo:     obsRepo,
+				Audit:    auditRepo,
 				Notifier: notifier,
 			},
 			Interval: cfg.GitOpsTimeoutInterval,
@@ -226,12 +257,12 @@ func main() {
 	// Slice P4: DB-backed discover scheduler. Reads from
 	// provider_connections via api/pkg/storage; the env-var path
 	// (SB_DISCOVER_TARGETS_JSON) is now a deprecated fallback used
-	// ONLY when the DB returns zero rows.
+	// ONLY when no DB-backed discover target exists at all.
 	pcRepo := storage.NewProviderConnections(pool)
 	sched.Register(scheduler.TaskRegistration{
 		Task: sweepers.DiscoverScheduler{
 			Jobs:        jobRepo,
-			Connections: pcRepo,
+			Connections: sweepers.DiscoverConnections{ProviderConnections: pcRepo, DB: pool},
 			Locks:       rt,
 			EnvFallback: targets,
 			Notifier:    notifier,

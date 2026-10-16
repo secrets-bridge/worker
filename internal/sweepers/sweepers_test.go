@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/secrets-bridge/api/pkg/runtime"
@@ -43,28 +44,38 @@ func (f *fakeStaleMarker) MarkStaleAsMissing(_ context.Context, cutoff time.Time
 	return f.flipped, f.err
 }
 
+// fakePool records the last statement and returns no rows. The
+// Postgres-backed tests in audit_pg_test.go cover real row flips.
 type fakePool struct {
-	mu          sync.Mutex
-	lastSQL     string
-	lastArgs    []any
-	rowsTouched int64
-	err         error
+	mu       sync.Mutex
+	lastSQL  string
+	lastArgs []any
+	err      error
 }
 
-func (f *fakePool) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+func (f *fakePool) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.lastSQL = sql
 	f.lastArgs = args
 	if f.err != nil {
-		return pgconn.CommandTag{}, f.err
+		return nil, f.err
 	}
-	// pgconn.CommandTag is opaque outside the package; pgconn doesn't
-	// expose a setter for RowsAffected, so the test asserts on the
-	// notification metadata rather than on the returned tag.
-	_ = f.rowsTouched
-	return pgconn.CommandTag{}, nil
+	return emptyRows{}, nil
 }
+
+// emptyRows is a pgx.Rows with no rows.
+type emptyRows struct{}
+
+func (emptyRows) Close()                                       {}
+func (emptyRows) Err() error                                   { return nil }
+func (emptyRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
+func (emptyRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
+func (emptyRows) Next() bool                                   { return false }
+func (emptyRows) Scan(...any) error                            { return errors.New("no rows") }
+func (emptyRows) Values() ([]any, error)                       { return nil, nil }
+func (emptyRows) RawValues() [][]byte                          { return nil }
+func (emptyRows) Conn() *pgx.Conn                              { return nil }
 
 type fakeJobCreator struct {
 	created []*storage.SyncJob
@@ -434,6 +445,14 @@ type fakeProviderConnections struct {
 	markedFinished   int
 	lastFinishStatus string
 	lastFinishErr    string
+	hasTargets       bool
+	hasErr           error
+	hasCalls         int
+}
+
+func (f *fakeProviderConnections) HasDiscoverTargets(_ context.Context) (bool, error) {
+	f.hasCalls++
+	return f.hasTargets, f.hasErr
 }
 
 func (f *fakeProviderConnections) ListDueForDiscovery(_ context.Context, _ time.Time) ([]storage.DiscoverTarget, error) {
@@ -479,4 +498,46 @@ func (f *flakyJobCreator) Create(_ context.Context, _ *storage.SyncJob) error {
 	}
 	f.success++
 	return nil
+}
+
+// WRK-N-05: if the scheduler can't tell whether DB targets exist, it
+// fails closed and does not run the env fallback.
+func TestDiscoverScheduler_EnvFallback_FailsClosedOnExistenceError(t *testing.T) {
+	jc := &fakeJobCreator{}
+	notif := &recordingNotifier{}
+	conn := &fakeProviderConnections{hasErr: errors.New("conn closed")}
+	sw := sweepers.DiscoverScheduler{
+		Jobs:        jc,
+		Connections: conn,
+		Locks:       &fakeLocker{},
+		Notifier:    notif,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		EnvFallback: []sweepers.DiscoverTarget{{Name: "env", Cluster: "c", ProviderType: "vault"}},
+	}
+	if err := sw.Run(t.Context()); err == nil || !strings.Contains(err.Error(), "conn closed") {
+		t.Fatalf("err = %v want the existence-check error", err)
+	}
+	if len(jc.created) != 0 {
+		t.Fatalf("env fallback enqueued %d job(s) despite the failed check", len(jc.created))
+	}
+	if titles := notif.titles(); len(titles) != 1 || !strings.Contains(titles[0], "env fallback skipped") {
+		t.Fatalf("titles = %v", titles)
+	}
+}
+
+// No env fallback configured: no extra existence query per tick.
+func TestDiscoverScheduler_NoEnvFallback_SkipsExistenceQuery(t *testing.T) {
+	conn := &fakeProviderConnections{}
+	sw := sweepers.DiscoverScheduler{
+		Jobs:        &fakeJobCreator{},
+		Connections: conn,
+		Locks:       &fakeLocker{},
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	if err := sw.Run(t.Context()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if conn.hasCalls != 0 {
+		t.Fatalf("HasDiscoverTargets called %d time(s) with no env fallback", conn.hasCalls)
+	}
 }

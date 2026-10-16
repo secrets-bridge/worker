@@ -21,8 +21,8 @@ const (
 )
 
 type Config struct {
-	LocalAddr      string
-	ShutdownGrace  time.Duration
+	LocalAddr     string
+	ShutdownGrace time.Duration
 
 	// Env is the deployment mode (SB_ENV). Recognised: "dev" or
 	// "production"; default "production" so a missing/forgotten env
@@ -32,13 +32,13 @@ type Config struct {
 
 	// Sweep cadences. Defaults err on the side of "won't spam your
 	// audit log" — operators tighten them as the deployment scales.
-	WrapsExpiredInterval         time.Duration
-	SecretsStaleInterval         time.Duration
-	AgentsStaleInterval          time.Duration
-	JobsRecoveryInterval         time.Duration
-	DiscoverInterval             time.Duration
-	RevealSessionsExpiredInterval     time.Duration
-	CrossTeamFillExpiredInterval      time.Duration
+	WrapsExpiredInterval          time.Duration
+	SecretsStaleInterval          time.Duration
+	AgentsStaleInterval           time.Duration
+	JobsRecoveryInterval          time.Duration
+	DiscoverInterval              time.Duration
+	RevealSessionsExpiredInterval time.Duration
+	CrossTeamFillExpiredInterval  time.Duration
 
 	// Cutoffs: how old a row must be before a sweeper flags it.
 	SecretsStaleAfter time.Duration
@@ -48,7 +48,7 @@ type Config struct {
 	DiscoverTargetsJSON string
 
 	// Notifications.
-	WebhookURL        string
+	WebhookURL         string
 	WebhookSlackFormat bool
 
 	// GitOps observation poller (BRD §26). Opt-in via
@@ -57,11 +57,11 @@ type Config struct {
 	// repo. When the api side has SB_GITOPS_ENABLED=false the worker
 	// MUST also be off — otherwise the poller would scan a table that
 	// will never receive rows.
-	GitOpsEnabled        bool
-	GitOpsPollInterval   time.Duration // default 15s during active rollout
+	GitOpsEnabled         bool
+	GitOpsPollInterval    time.Duration // default 15s during active rollout
 	GitOpsTimeoutInterval time.Duration // default 1m for the timeout sweeper
-	GitOpsBatchSize      int            // observations per tick; default 20
-	GitOpsHTTPTimeout    time.Duration  // per-ArgoCD-call ceiling; default 15s
+	GitOpsBatchSize       int           // observations per tick; default 20
+	GitOpsHTTPTimeout     time.Duration // per-ArgoCD-call ceiling; default 15s
 }
 
 // loadConfig reads the env vars and applies defaults. Returns an
@@ -69,14 +69,14 @@ type Config struct {
 // defaults.
 func loadConfig() (Config, error) {
 	cfg := Config{
-		LocalAddr:                "127.0.0.1:8091",
-		ShutdownGrace:            15 * time.Second,
-		Env:                      ModeProduction,
-		WrapsExpiredInterval:         1 * time.Minute,
-		SecretsStaleInterval:         5 * time.Minute,
-		AgentsStaleInterval:          1 * time.Minute,
-		JobsRecoveryInterval:         30 * time.Second,
-		DiscoverInterval:             1 * time.Hour,
+		LocalAddr:            "127.0.0.1:8091",
+		ShutdownGrace:        15 * time.Second,
+		Env:                  ModeProduction,
+		WrapsExpiredInterval: 1 * time.Minute,
+		SecretsStaleInterval: 5 * time.Minute,
+		AgentsStaleInterval:  1 * time.Minute,
+		JobsRecoveryInterval: 30 * time.Second,
+		DiscoverInterval:     1 * time.Hour,
 		// Reveal sessions are user-facing — a session ending late means
 		// a wrap could still be retrievable after the SPA already nuked
 		// its plaintext display. 5s keeps the gap close to invisible
@@ -89,12 +89,12 @@ func loadConfig() (Config, error) {
 		// Fill check rejects late writers anyway via
 		// ErrFillWindowExpired, so this sweeper is defense in depth.
 		CrossTeamFillExpiredInterval: 30 * time.Second,
-		SecretsStaleAfter:             24 * time.Hour,
-		AgentsStaleAfter:              5 * time.Minute,
-		GitOpsPollInterval:       15 * time.Second,
-		GitOpsTimeoutInterval:    1 * time.Minute,
-		GitOpsBatchSize:          20,
-		GitOpsHTTPTimeout:        15 * time.Second,
+		SecretsStaleAfter:            24 * time.Hour,
+		AgentsStaleAfter:             5 * time.Minute,
+		GitOpsPollInterval:           15 * time.Second,
+		GitOpsTimeoutInterval:        1 * time.Minute,
+		GitOpsBatchSize:              20,
+		GitOpsHTTPTimeout:            15 * time.Second,
 	}
 
 	if v := os.Getenv("SB_WORKER_LOCAL_ADDR"); v != "" {
@@ -157,5 +157,44 @@ func loadConfig() (Config, error) {
 		}
 		cfg.GitOpsBatchSize = n
 	}
+	if err := cfg.validate(); err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
+}
+
+// validate rejects values that would break the worker after it already
+// reported ready: time.NewTicker panics on a non-positive interval, a
+// non-positive *_STALE_AFTER moves the cutoff to now or later (every
+// row goes stale), and a negative HTTP timeout means no timeout.
+// Checked for every knob, including GitOps ones while GitOps is off, so
+// flipping SB_WORKER_GITOPS_ENABLED later can't surface a latent bad
+// value. WRK-N-06.
+func (c Config) validate() error {
+	for _, d := range []struct {
+		env string
+		val time.Duration
+	}{
+		{"SB_WORKER_SHUTDOWN_GRACE", c.ShutdownGrace},
+		{"SB_WORKER_WRAPS_EXPIRED_INTERVAL", c.WrapsExpiredInterval},
+		{"SB_WORKER_SECRETS_STALE_INTERVAL", c.SecretsStaleInterval},
+		{"SB_WORKER_AGENTS_STALE_INTERVAL", c.AgentsStaleInterval},
+		{"SB_WORKER_JOBS_RECOVERY_INTERVAL", c.JobsRecoveryInterval},
+		{"SB_WORKER_DISCOVER_INTERVAL", c.DiscoverInterval},
+		{"SB_WORKER_REVEAL_SESSIONS_EXPIRED_INTERVAL", c.RevealSessionsExpiredInterval},
+		{"SB_WORKER_CROSS_TEAM_FILL_EXPIRED_INTERVAL", c.CrossTeamFillExpiredInterval},
+		{"SB_WORKER_SECRETS_STALE_AFTER", c.SecretsStaleAfter},
+		{"SB_WORKER_AGENTS_STALE_AFTER", c.AgentsStaleAfter},
+		{"SB_WORKER_GITOPS_POLL_INTERVAL", c.GitOpsPollInterval},
+		{"SB_WORKER_GITOPS_TIMEOUT_INTERVAL", c.GitOpsTimeoutInterval},
+		{"SB_WORKER_GITOPS_HTTP_TIMEOUT", c.GitOpsHTTPTimeout},
+	} {
+		if d.val <= 0 {
+			return fmt.Errorf("config: %s must be greater than zero (got %s)", d.env, d.val)
+		}
+	}
+	if c.GitOpsBatchSize < 1 {
+		return fmt.Errorf("config: SB_WORKER_GITOPS_BATCH_SIZE must be at least 1 (got %d)", c.GitOpsBatchSize)
+	}
+	return nil
 }
