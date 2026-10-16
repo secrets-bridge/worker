@@ -124,6 +124,7 @@ func main() {
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	registry.MustRegister(collectors.NewGoCollector())
+	registry.MustRegister(sweepers.Collectors()...)
 	sched := scheduler.New(rt, logger, registry)
 
 	wrapRepo := storage.NewSecretWraps(pool)

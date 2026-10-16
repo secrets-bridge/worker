@@ -22,6 +22,7 @@ package sweepers
 
 import (
 	"context"
+	"log/slog"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -52,12 +53,21 @@ type pgxRowQuerier interface {
 type Pool = pgxpool.Pool
 
 // notify is shared by sweepers as a tiny wrapper to keep the
-// boilerplate down. Returns nil — sweepers never bubble a
-// notification failure as their own outcome (notification errors are
-// logged + counted by the Fanout itself).
+// boilerplate down. A notification failure never becomes the sweep's
+// own outcome, but it is logged and counted: sweeper name, sink and
+// an error class only. The error text can carry the webhook URL (and
+// its secret path) and the event can carry ids, so neither is logged.
+// WRK-N-07.
 func notify(ctx context.Context, n notifications.Notifier, ev notifications.Event) {
 	if n == nil {
 		return
 	}
-	_ = n.Notify(ctx, ev)
+	if err := n.Notify(ctx, ev); err != nil {
+		notifyFailures.WithLabelValues(ev.Component).Inc()
+		slog.Default().Warn("sweepers: notification failed",
+			"sweeper", ev.Component,
+			"sink", n.Name(),
+			"error_class", notifications.ErrorClass(err),
+		)
+	}
 }
