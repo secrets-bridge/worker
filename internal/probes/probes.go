@@ -13,10 +13,21 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+// Timeouts for the probe listener. Kubelet and Prometheus are the only
+// expected clients, so these only need to bound a slow or stalled
+// connection (gosec G112). They match the api's Fiber server.
+const (
+	readHeaderTimeout = 5 * time.Second
+	readTimeout       = 10 * time.Second
+	writeTimeout      = 15 * time.Second
+	idleTimeout       = 60 * time.Second
 )
 
 // CheckFunc returns nil if the dependency is healthy.
@@ -66,13 +77,28 @@ func (s *Server) SetReady(ready bool) { s.ready.Store(ready) }
 
 // ListenAndServe blocks until the underlying http.Server returns.
 func (s *Server) ListenAndServe() error {
+	srv := newHTTPServer(s.addr, s.handler())
+	s.srv = srv
+	return srv.ListenAndServe()
+}
+
+func (s *Server) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.healthz)
 	mux.HandleFunc("/readyz", s.readyz)
 	mux.Handle("/metrics", promhttp.HandlerFor(s.registry, promhttp.HandlerOpts{}))
-	srv := &http.Server{Addr: s.addr, Handler: mux}
-	s.srv = srv
-	return srv.ListenAndServe()
+	return mux
+}
+
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
+	}
 }
 
 // Shutdown gracefully stops the http.Server.
@@ -116,4 +142,3 @@ func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(body)
 }
-
