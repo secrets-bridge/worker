@@ -43,6 +43,20 @@ import (
 // buildVersion is set at link time.
 var buildVersion = "dev"
 
+// revealSessionsRetry bounds the retries inside one reveal-sessions
+// tick (worst case about 1.8s of backoff). The sweeper ticks every few
+// seconds and its self-heal redoes missed work on the next tick, while
+// DefaultPolicy's growing backoff (up to 1h per wait, over an hour in
+// total) would keep the sweeper lock and stall every later sweep after
+// a database blip. WRK-N-01.
+func revealSessionsRetry() retry.Policy {
+	return retry.Policy{
+		InitialDelay: 500 * time.Millisecond,
+		MaxDelay:     time.Second,
+		MaxAttempts:  3,
+	}
+}
+
 func main() {
 	cfg, err := loadConfig()
 	if err != nil {
@@ -159,10 +173,11 @@ func main() {
 		Task: sweepers.RevealSessionsExpired{
 			Sessions: revealSessionRepo,
 			Wraps:    wrapRepo,
+			Store:    sweepers.RevealSessionStore{DB: pool},
 			Notifier: notifier,
 		},
 		Interval: cfg.RevealSessionsExpiredInterval,
-		Retry:    retry.DefaultPolicy(),
+		Retry:    revealSessionsRetry(),
 	})
 
 	// Slice N4 — cross-team fill-window expiry sweeper. Flips

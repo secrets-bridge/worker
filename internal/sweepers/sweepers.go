@@ -23,6 +23,7 @@ package sweepers
 import (
 	"context"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -35,6 +36,13 @@ import (
 // satisfies it.
 type pgxQuerier interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+// pgxRowQuerier is the slice of the pool used by worker-side queries
+// that read rows back (UPDATE ... RETURNING). *storage.Pool and
+// *pgxpool.Pool satisfy it.
+type pgxRowQuerier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
 
 // Pool is the worker-side alias for the pgxpool used by sweepers

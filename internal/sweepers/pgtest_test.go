@@ -93,17 +93,3 @@ func makeReadRequest(t *testing.T, pool *storage.Pool) uuid.UUID {
 	}
 	return req.ID
 }
-
-// auditRows returns every audit_events row, oldest first.
-func auditRows(t *testing.T, pool *storage.Pool) []*storage.AuditEvent {
-	t.Helper()
-	rows, err := storage.NewAuditEvents(pool).Query(t.Context(), storage.AuditQuery{Limit: 1000})
-	if err != nil {
-		t.Fatalf("audit Query: %v", err)
-	}
-	// Query returns newest first; flip for readable assertions.
-	for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
-		rows[i], rows[j] = rows[j], rows[i]
-	}
-	return rows
-}
