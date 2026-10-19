@@ -27,6 +27,7 @@ The Secrets Bridge background worker. It runs periodic sweepers against the cont
 | `jobs_recovery` | Flags jobs stuck in a claimed state |
 | `discover_scheduler` | Enqueues discovery jobs |
 | `gitops_poller`, `gitops_timeout` | Optional read-only ArgoCD observation; enable with `SB_WORKER_GITOPS_ENABLED` (must match the api setting) |
+| `users_pending` | One webhook message per run for accounts that started waiting for approval; only with a webhook |
 
 ## Build and test
 
@@ -41,13 +42,13 @@ go mod tidy   # CI fails on a diff
 
 ## Configuration
 
-`DATABASE_URL`, `REDIS_URL`, `SB_ENV`, one `SB_WORKER_<SWEEPER>_INTERVAL` per sweeper, `SB_WORKER_SECRETS_STALE_AFTER`, `SB_WORKER_AGENTS_STALE_AFTER`, optional `SB_WORKER_WEBHOOK_URL`.
+`DATABASE_URL`, `REDIS_URL`, `SB_ENV`, one `SB_WORKER_<SWEEPER>_INTERVAL` per sweeper, `SB_WORKER_SECRETS_STALE_AFTER`, `SB_WORKER_AGENTS_STALE_AFTER`, optional `SB_WORKER_WEBHOOK_URL`, optional `SB_PUBLIC_URL` (the link in the `users_pending` message).
 
 ## Rules for this repo
 
 - Stateless: all state lives in Postgres and Redis.
 - Sweepers must be idempotent and safe to run concurrently with other replicas.
-- Never log, audit or notify secret values, tokens or row contents. Report counts, cutoffs and sweeper names.
+- Never log, audit or notify secret values, tokens or row contents. Report counts, cutoffs and sweeper names. The one exception is `users_pending`, which lists the waiting accounts' emails in its webhook message (api#265). It sends to the webhook alone, never the log sink, and never includes display names.
 - No provider SDKs here. Anything that touches a provider runs in the agent.
 - A losing lock is normal (N-1 replicas skip each tick); count it in metrics, do not log it as a warning.
 - If a change needs a new query or table in `api`, land the `api` PR first.

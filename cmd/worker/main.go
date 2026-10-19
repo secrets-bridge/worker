@@ -111,10 +111,12 @@ func main() {
 
 	// Notifier: webhook if configured, NoOp otherwise.
 	var notifier notifications.Notifier = &notifications.NoOp{Logger: logger}
+	var webhook notifications.Notifier
 	if cfg.WebhookURL != "" {
+		webhook = &notifications.Webhook{URL: cfg.WebhookURL, FormatSlack: cfg.WebhookSlackFormat}
 		notifier = &notifications.Fanout{Sinks: []notifications.Notifier{
 			&notifications.NoOp{Logger: logger},
-			&notifications.Webhook{URL: cfg.WebhookURL, FormatSlack: cfg.WebhookSlackFormat},
+			webhook,
 		}}
 		logger.Info("notifications: webhook configured",
 			"slack_format", cfg.WebhookSlackFormat)
@@ -202,6 +204,24 @@ func main() {
 		Interval: cfg.CrossTeamFillExpiredInterval,
 		Retry:    retry.DefaultPolicy(),
 	})
+
+	// Accounts waiting for approval (worker#34). The message names
+	// people, so it goes to the webhook alone: the NoOp sink in the
+	// fanout would write it to the log. No webhook, nothing to send.
+	if webhook != nil {
+		sched.Register(scheduler.TaskRegistration{
+			Task: sweepers.UsersPending{
+				Pool:      pool,
+				Cursor:    sweepers.RedisUsersPendingCursor{Client: rt},
+				Notifier:  webhook,
+				PublicURL: cfg.PublicURL,
+			},
+			Interval: cfg.UsersPendingInterval,
+			Retry:    retry.DefaultPolicy(),
+		})
+	} else {
+		logger.Info("waiting-account messages off (set SB_WORKER_WEBHOOK_URL to send them)")
+	}
 
 	// GitOps observation poller (BRD §26). OFF by default — must be
 	// opt-in via SB_WORKER_GITOPS_ENABLED=true AND the api side must

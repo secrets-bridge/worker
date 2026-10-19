@@ -25,7 +25,7 @@ internal/
   retry/            exponential-backoff retry policy
   notifications/    pluggable sink interface + Webhook + NoOp + Fanout
   scheduler/        Redis-lock leader-elected periodic runner
-  sweepers/         WrapsExpired, SecretsStale, AgentsStale, JobsRecovery, DiscoverScheduler
+  sweepers/         WrapsExpired, SecretsStale, AgentsStale, JobsRecovery, DiscoverScheduler, UsersPending
 ```
 
 The worker imports `github.com/secrets-bridge/api/pkg/{storage,runtime}` per the REFACTOR_PLAN §4 polyrepo rule. A local `replace` directive keeps cross-repo iteration fast while interfaces stabilize.
@@ -41,6 +41,7 @@ The worker imports `github.com/secrets-bridge/api/pkg/{storage,runtime}` per the
 | `discover-scheduler` | Enqueue one discover job per configured target every interval | 1h | none |
 | `gitops-poller` | Poll ArgoCD per active observation, record observed_state, transition terminal states (applied / failed) | 15s | none (opt-in via `SB_WORKER_GITOPS_ENABLED`) |
 | `gitops-timeout` | Flip rows past `timeout_at` to `applied_unverified` | 1m | none (opt-in via `SB_WORKER_GITOPS_ENABLED`) |
+| `users-pending` | Post one webhook message for accounts that started waiting for approval (below) | 1m | none (only with `SB_WORKER_WEBHOOK_URL`) |
 
 Each sweeper:
 - Runs under a Redis lock (`worker:sweeper:<name>`), so with multiple replicas only one runs per tick.
@@ -67,6 +68,8 @@ Each sweeper:
 | `SB_DISCOVER_TARGETS_JSON` | (unset) | Discover scheduler targets (see below) |
 | `SB_WORKER_WEBHOOK_URL` | (unset) | If set, notifications go to this URL |
 | `SB_WORKER_WEBHOOK_SLACK_FORMAT` | `false` | Use Slack's `{"text": ...}` shape |
+| `SB_WORKER_USERS_PENDING_INTERVAL` | `1m` | How often `users-pending` looks for new waiting accounts; at most one message per run. At least `30s` |
+| `SB_PUBLIC_URL` | (unset) | The address people open the console with, for the link in the `users-pending` message. Unset, the address saved in the console is used. Same variable and rule as the api's: `https://`, or `http://` for localhost only |
 | `SB_WORKER_GITOPS_ENABLED` | `false` | Opt-in for the GitOps observation poller + timeout sweeper (BRD §26). Must match api's `SB_GITOPS_ENABLED`. When enabled, requires a configured `KeyManager` (`SB_KMS_BACKEND` etc.) to unwrap stored ArgoCD tokens. |
 | `SB_WORKER_GITOPS_POLL_INTERVAL` | `15s` | Tick cadence of the gitops-poller sweeper |
 | `SB_WORKER_GITOPS_TIMEOUT_INTERVAL` | `1m` | Tick cadence of the gitops-timeout sweeper |
@@ -75,6 +78,16 @@ Each sweeper:
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 
 Every duration above must be greater than zero and `SB_WORKER_GITOPS_BATCH_SIZE` at least 1. Anything else stops the worker at boot with an error naming the variable.
+
+### Accounts waiting for approval
+
+Someone who signs in with Google for the first time gets an account that waits until an admin approves it on Admin → Users. `users-pending` tells the admins: each run posts at most one message to the webhook with the accounts that started waiting since the last one, up to 10 by email, then "and N more", and a link to `<public address>/admin/users`.
+
+- **Emails, never display names.** A display name comes from the person's Google account and can be anything, and Slack turns URL-shaped text into links and reads `*`, `_` and `~` as formatting. An email had to pass Google's `hd` check and the allowed domains.
+- **Webhook only.** The message still names people, so it never goes to the log: the worker logs the counts. Without `SB_WORKER_WEBHOOK_URL` the sweeper isn't registered, and the console's badge and Overview banner show who is waiting.
+- **Once each.** A cursor in Redis (`<ns>:cursor:users-pending`) remembers the newest account announced. It moves only after the webhook accepts the message, so a failed post is retried on the next run. With no cursor yet, the accounts already waiting are announced once. A cursor that can't be saved after a post ends the tick without a retry, so the message isn't sent twice in one tick; the next tick sends it once more.
+- **Slack escaping.** The Slack format escapes `&`, `<` and `>` in every message, so event text can't mention `@channel` or dress up a link. Emails also lose control and format characters before they go in.
+- Accounts younger than 30 seconds wait for the next run, so one whose transaction commits late can't slip behind the cursor.
 
 ArgoCD endpoints must use `https://`. Plain `http://` is only polled when `SB_ENV=dev`; otherwise the endpoint is skipped before its token is unwrapped and a health error is recorded on it.
 
