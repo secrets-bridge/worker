@@ -1,7 +1,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -157,11 +159,11 @@ func loadConfig() (Config, error) {
 		cfg.WebhookSlackFormat = b
 	}
 	if v := os.Getenv("SB_PUBLIC_URL"); v != "" {
-		u, err := url.Parse(v)
-		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-			return Config{}, fmt.Errorf("config: SB_PUBLIC_URL must be an http(s) address with no user, query or fragment")
+		u, err := normalizePublicURL(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("config: SB_PUBLIC_URL %w", err)
 		}
-		cfg.PublicURL = strings.TrimRight(v, "/")
+		cfg.PublicURL = u
 	}
 	if v := os.Getenv("SB_WORKER_GITOPS_ENABLED"); v != "" {
 		b, err := strconv.ParseBool(v)
@@ -182,6 +184,35 @@ func loadConfig() (Config, error) {
 	}
 	return cfg, nil
 }
+
+// normalizePublicURL is the api's rule for SB_PUBLIC_URL
+// (services.NormalizePublicURL), so a value the api accepts works here
+// and one it refuses stops the worker too: https, or plain http for
+// localhost or a loopback address only; no user, query or fragment; no
+// trailing slash.
+func normalizePublicURL(raw string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" {
+		return "", errors.New("must be an absolute address such as https://secrets.example.com")
+	}
+	host := u.Hostname()
+	ip := net.ParseIP(host)
+	loopback := host == "localhost" || (ip != nil && ip.IsLoopback())
+	switch {
+	case u.Scheme == "https":
+	case u.Scheme == "http" && loopback:
+	default:
+		return "", errors.New("must use https (http is allowed for localhost only)")
+	}
+	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return "", errors.New("must not carry user info, a query or a fragment")
+	}
+	return strings.TrimRight(u.Scheme+"://"+u.Host+u.EscapedPath(), "/"), nil
+}
+
+// minUsersPendingInterval keeps the waiting-account messages from
+// turning into a stream: at most one message per run.
+const minUsersPendingInterval = 30 * time.Second
 
 // validate rejects values that would break the worker after it already
 // reported ready: time.NewTicker panics on a non-positive interval, a
@@ -213,6 +244,9 @@ func (c Config) validate() error {
 		if d.val <= 0 {
 			return fmt.Errorf("config: %s must be greater than zero (got %s)", d.env, d.val)
 		}
+	}
+	if c.UsersPendingInterval < minUsersPendingInterval {
+		return fmt.Errorf("config: SB_WORKER_USERS_PENDING_INTERVAL must be at least %s (got %s)", minUsersPendingInterval, c.UsersPendingInterval)
 	}
 	if c.GitOpsBatchSize < 1 {
 		return fmt.Errorf("config: SB_WORKER_GITOPS_BATCH_SIZE must be at least 1 (got %d)", c.GitOpsBatchSize)

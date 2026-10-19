@@ -19,14 +19,17 @@ import (
 	"github.com/secrets-bridge/api/pkg/storage"
 
 	"github.com/secrets-bridge/worker/internal/notifications"
+	"github.com/secrets-bridge/worker/internal/retry"
 	"github.com/secrets-bridge/worker/internal/sweepers"
 )
 
-// memCursor is an in-memory cursor store.
+// memCursor is an in-memory cursor store. failSets makes that many
+// Set calls fail first, like Redis refusing writes at maxmemory.
 type memCursor struct {
-	cur  sweepers.UsersPendingCursor
-	ok   bool
-	sets int
+	cur      sweepers.UsersPendingCursor
+	ok       bool
+	sets     int
+	failSets int
 }
 
 func (m *memCursor) Get(context.Context) (sweepers.UsersPendingCursor, bool, error) {
@@ -34,6 +37,10 @@ func (m *memCursor) Get(context.Context) (sweepers.UsersPendingCursor, bool, err
 }
 
 func (m *memCursor) Set(_ context.Context, c sweepers.UsersPendingCursor) error {
+	if m.failSets > 0 {
+		m.failSets--
+		return errors.New("OOM command not allowed when used memory > 'maxmemory'")
+	}
 	m.cur, m.ok = c, true
 	m.sets++
 	return nil
@@ -55,11 +62,14 @@ func (w *webhookSink) Notify(_ context.Context, e notifications.Event) error {
 
 func (w *webhookSink) Name() string { return "webhook" }
 
-// pendingPool is testPool with the console's public address cleared.
+// pendingPool is testPool with the sign-in settings row back to its
+// seeded state: present, with no public address.
 func pendingPool(t *testing.T) *storage.Pool {
 	t.Helper()
 	pool := testPool(t)
-	if _, err := pool.Exec(t.Context(), `UPDATE sso_settings SET public_url = NULL`); err != nil {
+	if _, err := pool.Exec(t.Context(), `
+		INSERT INTO sso_settings (id) VALUES (true)
+		ON CONFLICT (id) DO UPDATE SET public_url = NULL`); err != nil {
 		t.Fatalf("reset sso_settings: %v", err)
 	}
 	return pool
@@ -114,7 +124,7 @@ func TestUsersPending_AnnouncesNewAccountsOnce(t *testing.T) {
 	if ev.Title != "3 new accounts are waiting for approval" {
 		t.Errorf("title = %q", ev.Title)
 	}
-	wantList := "• Sara Ahmed (sara@example.com)\n• omar@example.com\n• Lina Haddad (lina@example.com)\n4 waiting in all. "
+	wantList := "• sara@example.com\n• omar@example.com\n• lina@example.com\n4 waiting in all. "
 	if !strings.HasPrefix(ev.Detail, wantList) {
 		t.Errorf("detail = %q, want it to start with %q", ev.Detail, wantList)
 	}
@@ -145,10 +155,10 @@ func TestUsersPending_AnnouncesNewAccountsOnce(t *testing.T) {
 	}
 }
 
-// One message per run, however many arrive: ten by name, then a count.
+// One message per run, however many arrive: ten by email, then a count.
 // The cursor moves past all of them, so the rest aren't announced
 // again.
-func TestUsersPending_TenByNameThenACount(t *testing.T) {
+func TestUsersPending_TenListedThenACount(t *testing.T) {
 	pool := pendingPool(t)
 	for i := range 12 {
 		addAccounts(t, pool, account{email: fmt.Sprintf("p%02d@example.com", i), age: time.Duration(20-i) * time.Minute})
@@ -235,14 +245,19 @@ func TestUsersPending_LinkToAdminUsers(t *testing.T) {
 	}
 }
 
-// A display name comes from the person's Google account. In the Slack
-// message it can't break onto new lines, reorder the text with bidi
-// controls, mention @channel or hide a link, and a long one is cut.
-func TestUsersPending_NamesAreCleaned(t *testing.T) {
+// A display name comes from the person's Google account and can be
+// anything. Slack links URL-shaped text and reads *, _ and ~ as
+// formatting, so names never go in the message: only emails, which had
+// to pass the hd and domain checks. The approval link is the only link.
+func TestUsersPending_NoDisplayNames(t *testing.T) {
 	pool := pendingPool(t)
+	if _, err := pool.Exec(t.Context(), `UPDATE sso_settings SET public_url = 'https://secrets.example.com'`); err != nil {
+		t.Fatal(err)
+	}
 	addAccounts(t, pool,
-		account{email: "eve@example.com", name: "Eve\n\n<!channel>\u202Eevil\u200B <https://phish.example|Approve>", age: 2 * time.Hour},
-		account{email: "long@example.com", name: strings.Repeat("a", 200), age: time.Hour},
+		account{email: "eve@example.com", name: "https://evil.example/admin/users", age: 3 * time.Hour},
+		account{email: "mal@example.com", name: "approve.evil.example *Approve here* <!channel>", age: 2 * time.Hour},
+		account{email: "odd\u200b@example.com", name: "Odd", age: time.Hour},
 	)
 	var body string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -259,20 +274,52 @@ func TestUsersPending_NamesAreCleaned(t *testing.T) {
 
 	runPending(t, sweepers.UsersPending{Pool: pool, Cursor: &memCursor{}, Notifier: webhook})
 
-	wantEve := "• Eve &lt;!channel&gt;evil &lt;https://phish.example|Approve&gt; (eve@example.com)\n"
-	if !strings.Contains(body, wantEve) {
-		t.Errorf("slack text = %q, want it to contain %q", body, wantEve)
+	want := "[info] 3 new accounts are waiting for approval\n• eve@example.com\n• mal@example.com\n• odd@example.com\n" +
+		"Approve or decline them in Admin → Users: https://secrets.example.com/admin/users"
+	if body != want {
+		t.Errorf("slack text = %q, want %q", body, want)
 	}
-	for _, bad := range []string{"<!channel>", "<https://", "\u202E", "\u200B", "Eve\n"} {
-		if strings.Contains(body, bad) {
-			t.Errorf("slack text contains %q: %q", bad, body)
+	for _, name := range []string{"evil.example", "Approve here", "channel", "Odd"} {
+		if strings.Contains(body, name) {
+			t.Errorf("slack text carries display-name text %q: %q", name, body)
 		}
 	}
-	if want := "• " + strings.Repeat("a", 79) + "… (long@example.com)\n"; !strings.Contains(body, want) {
-		t.Errorf("long name not cut at 80: %q", body)
+}
+
+// A cursor that can't be saved after a post must not make the
+// scheduler's retry post the same message again within the tick
+// (Redis refusing SET at maxmemory, while GET and the lock still work).
+func TestUsersPending_CursorSaveFailureSendsOnce(t *testing.T) {
+	pool := pendingPool(t)
+	addAccounts(t, pool, account{email: "sara@example.com", age: time.Hour})
+	sink, cur := &webhookSink{}, &memCursor{failSets: 2}
+	s := sweepers.UsersPending{Pool: pool, Cursor: cur, Notifier: sink}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := retry.DefaultPolicy().Run(ctx, s.Run); err == nil {
+		t.Fatal("Run with a failing cursor save returned nil")
 	}
-	if !strings.HasPrefix(body, "[info] 2 new accounts are waiting for approval\n• ") {
-		t.Errorf("list doesn't start on its own line: %q", body)
+	if len(sink.events) != 1 {
+		t.Fatalf("one tick posted %d messages, want 1", len(sink.events))
+	}
+}
+
+// The settings row is seeded by a migration, but a missing one must not
+// make every run fail: the message goes out without a link.
+func TestUsersPending_MissingSettingsRow(t *testing.T) {
+	pool := pendingPool(t)
+	if _, err := pool.Exec(t.Context(), `DELETE FROM sso_settings`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `INSERT INTO sso_settings (id) VALUES (true) ON CONFLICT DO NOTHING`)
+	})
+	addAccounts(t, pool, account{email: "sara@example.com", age: time.Hour})
+	sink := &webhookSink{}
+	runPending(t, sweepers.UsersPending{Pool: pool, Cursor: &memCursor{}, Notifier: sink})
+	if len(sink.events) != 1 || !strings.HasSuffix(sink.events[0].Detail, "under Admin → Users.") {
+		t.Fatalf("got %+v", sink.events)
 	}
 }
 

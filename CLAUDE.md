@@ -48,7 +48,7 @@ go mod tidy   # CI fails on a diff
 
 - Stateless: all state lives in Postgres and Redis.
 - Sweepers must be idempotent and safe to run concurrently with other replicas.
-- Never log, audit or notify secret values, tokens or row contents. Report counts, cutoffs and sweeper names. The one exception is `users_pending`, which names the waiting accounts in its webhook message (api#265). It sends to the webhook alone, never the log sink, and cleans display names first.
+- Never log, audit or notify secret values, tokens or row contents. Report counts, cutoffs and sweeper names. The one exception is `users_pending`, which lists the waiting accounts' emails in its webhook message (api#265). It sends to the webhook alone, never the log sink, and never includes display names.
 - No provider SDKs here. Anything that touches a provider runs in the agent.
 - A losing lock is normal (N-1 replicas skip each tick); count it in metrics, do not log it as a warning.
 - If a change needs a new query or table in `api`, land the `api` PR first.

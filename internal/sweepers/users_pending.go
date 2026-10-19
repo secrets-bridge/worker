@@ -16,6 +16,7 @@ import (
 	"github.com/secrets-bridge/api/pkg/runtime"
 
 	"github.com/secrets-bridge/worker/internal/notifications"
+	"github.com/secrets-bridge/worker/internal/retry"
 )
 
 // UsersPending tells the admins when accounts start waiting for
@@ -23,19 +24,27 @@ import (
 // time gets an account that can't do anything until an admin approves
 // it on Admin → Users (api#265). Each run posts at most one message:
 // the accounts that started waiting since the last message, up to
-// UsersPendingListMax by name and email, then "and N more", and a link
-// to Admin → Users built from the install's public address.
+// UsersPendingListMax by email, then "and N more", and a link to
+// Admin → Users built from the install's public address.
 //
-// The message names people, so it goes to the webhook only. Main never
-// hands this sweeper the log sink, and the sweeper itself logs counts
-// only. Without a webhook it isn't registered: the console's badge and
-// Overview banner already show who is waiting.
+// Emails only, never display names. A display name comes from the
+// person's Google account and can be anything, and Slack turns
+// URL-shaped text into a link and reads *, _ and ~ as formatting, so a
+// name could pose as the approval link. An email had to pass Google's
+// hd check and the allowed domains to get here.
+//
+// The message still names people, so it goes to the webhook only. Main
+// never hands this sweeper the log sink, and the sweeper itself logs
+// counts only. Without a webhook it isn't registered: the console's
+// badge and Overview banner already show who is waiting.
 //
 // The cursor (created_at and id of the newest account announced) lives
 // in Redis and moves only after the webhook accepts the message, so a
 // failed post is retried on the next run, together with anyone who
 // arrived since. With no cursor (first run, or Redis lost it), the
-// accounts already waiting are announced once.
+// accounts already waiting are announced once. A cursor that can't be
+// saved after a post is a permanent error for the tick: retrying inside
+// the tick would post the same message again.
 //
 // created_at is the inserting transaction's start time, so an account
 // whose transaction commits late can carry a time older than one that
@@ -56,7 +65,6 @@ const (
 	// UsersPendingSettle is how old an account must be to be announced.
 	UsersPendingSettle = 30 * time.Second
 
-	maxNameRunes  = 80
 	maxEmailRunes = 254
 )
 
@@ -75,10 +83,6 @@ type usersPendingCursorStore interface {
 // Name returns the stable identifier for this sweeper.
 func (s UsersPending) Name() string { return "users-pending" }
 
-type pendingAccount struct {
-	email, name string
-}
-
 // Run announces the accounts that started waiting since the last
 // message. A failed post leaves the cursor where it was and isn't an
 // error: the next tick retries it.
@@ -89,12 +93,12 @@ func (s UsersPending) Run(ctx context.Context) error {
 	}
 	// The zero cursor (year 1, nil id) sorts before every account.
 	const q = `
-		SELECT email, display_name,
+		SELECT email,
 		       count(*) OVER (),
 		       first_value(created_at) OVER newest,
 		       first_value(id) OVER newest,
 		       (SELECT count(*) FROM local_users WHERE pending_approval AND NOT disabled),
-		       (SELECT COALESCE(public_url, '') FROM sso_settings WHERE id)
+		       COALESCE((SELECT public_url FROM sso_settings WHERE id), '')
 		FROM local_users
 		WHERE pending_approval AND NOT disabled
 		  AND (created_at, id) > ($1::timestamptz, $2::uuid)
@@ -108,22 +112,22 @@ func (s UsersPending) Run(ctx context.Context) error {
 	}
 	defer rows.Close()
 	var (
-		accounts         []pendingAccount
+		emails           []string
 		fresh, waiting   int64
 		newest           UsersPendingCursor
 		consolePublicURL string
 	)
 	for rows.Next() {
-		var a pendingAccount
-		if err := rows.Scan(&a.email, &a.name, &fresh, &newest.CreatedAt, &newest.ID, &waiting, &consolePublicURL); err != nil {
+		var email string
+		if err := rows.Scan(&email, &fresh, &newest.CreatedAt, &newest.ID, &waiting, &consolePublicURL); err != nil {
 			return fmt.Errorf("sweepers: users-pending: scan: %w", err)
 		}
-		accounts = append(accounts, a)
+		emails = append(emails, email)
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("sweepers: users-pending: list: %w", err)
 	}
-	if len(accounts) == 0 {
+	if len(emails) == 0 {
 		return nil
 	}
 
@@ -131,35 +135,31 @@ func (s UsersPending) Run(ctx context.Context) error {
 	if publicURL == "" {
 		publicURL = strings.TrimRight(consolePublicURL, "/")
 	}
-	ev := usersPendingEvent(accounts, fresh, waiting, publicURL)
+	ev := usersPendingEvent(emails, fresh, waiting, publicURL)
 	if !notify(ctx, s.Notifier, ev) {
 		return nil
 	}
 	if err := s.Cursor.Set(ctx, newest); err != nil {
-		// The next run announces these accounts again; better twice
-		// than never.
-		return fmt.Errorf("sweepers: users-pending: save cursor: %w", err)
+		// Permanent: the scheduler's retry would run the tick again and
+		// post the same message again. The next tick announces these
+		// accounts once more; better twice than never.
+		return retry.Permanent(fmt.Errorf("sweepers: users-pending: save cursor: %w", err))
 	}
 	slog.Default().Info("sweepers: announced waiting accounts",
 		"sweeper", s.Name(), "new", fresh, "waiting", waiting)
 	return nil
 }
 
-func usersPendingEvent(accounts []pendingAccount, fresh, waiting int64, publicURL string) notifications.Event {
+func usersPendingEvent(emails []string, fresh, waiting int64, publicURL string) notifications.Event {
 	title := fmt.Sprintf("%d new accounts are waiting for approval", fresh)
 	if fresh == 1 {
 		title = "1 new account is waiting for approval"
 	}
 	var b strings.Builder
-	for _, a := range accounts {
-		email := plainText(a.email, maxEmailRunes)
-		if name := plainText(a.name, maxNameRunes); name != "" && name != email {
-			fmt.Fprintf(&b, "• %s (%s)\n", name, email)
-		} else {
-			fmt.Fprintf(&b, "• %s\n", email)
-		}
+	for _, email := range emails {
+		fmt.Fprintf(&b, "• %s\n", plainText(email, maxEmailRunes))
 	}
-	if more := fresh - int64(len(accounts)); more > 0 {
+	if more := fresh - int64(len(emails)); more > 0 {
 		fmt.Fprintf(&b, "and %d more.\n", more)
 	}
 	if waiting > fresh {
@@ -182,12 +182,12 @@ func usersPendingEvent(accounts []pendingAccount, fresh, waiting int64, publicUR
 	}
 }
 
-// plainText makes a name or email safe to put on one line of a chat
-// message. Display names come from the person's Google account, so they
-// can hold anything. It drops control and format characters (newlines,
-// bidi overrides, zero-width marks) and invalid UTF-8, folds whitespace
-// runs into one space and cuts the text at max runes with "…". The
-// Slack format escapes &, < and > on top.
+// plainText makes an email safe to put on one line of a chat message,
+// in case one ever arrives with something odd in it. It drops control
+// and format characters (newlines, bidi overrides, zero-width marks)
+// and invalid UTF-8, folds whitespace runs into one space and cuts the
+// text at max runes with "…". The Slack format escapes &, < and > on
+// top.
 func plainText(s string, maxRunes int) string {
 	var out []rune
 	space := false

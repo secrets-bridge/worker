@@ -93,12 +93,30 @@ func TestLoadConfig_PublicURL(t *testing.T) {
 	if cfg.PublicURL != "https://secrets.example.com" {
 		t.Fatalf("PublicURL = %q, want the address without the trailing slash", cfg.PublicURL)
 	}
-	for _, bad := range []string{"secrets.example.com", "javascript:alert(1)", "https://user@secrets.example.com", "https://secrets.example.com/?x=1", "https://secrets.example.com/#x"} {
+	for in, want := range map[string]string{"http://localhost:5173/": "http://localhost:5173", "http://127.0.0.1:8080": "http://127.0.0.1:8080", " https://secrets.example.com/console/ ": "https://secrets.example.com/console"} {
+		t.Setenv("SB_PUBLIC_URL", in)
+		if cfg, err := loadConfig(); err != nil || cfg.PublicURL != want {
+			t.Errorf("loadConfig(%q) = %q, %v; want %q", in, cfg.PublicURL, err, want)
+		}
+	}
+	for _, bad := range []string{"secrets.example.com", "javascript:alert(1)", "http://secrets.example.com", "https://user@secrets.example.com", "https://secrets.example.com/?x=1", "https://secrets.example.com/#x"} {
 		t.Run(bad, func(t *testing.T) {
 			t.Setenv("SB_PUBLIC_URL", bad)
 			if _, err := loadConfig(); err == nil || !strings.Contains(err.Error(), "SB_PUBLIC_URL") {
 				t.Fatalf("loadConfig(%q) = %v, want an error naming SB_PUBLIC_URL", bad, err)
 			}
 		})
+	}
+}
+
+// At most one message per run, so a tiny interval would stream them.
+func TestLoadConfig_UsersPendingIntervalFloor(t *testing.T) {
+	t.Setenv("SB_WORKER_USERS_PENDING_INTERVAL", "10s")
+	if _, err := loadConfig(); err == nil || !strings.Contains(err.Error(), "SB_WORKER_USERS_PENDING_INTERVAL") {
+		t.Fatalf("loadConfig accepted a 10s interval: %v", err)
+	}
+	t.Setenv("SB_WORKER_USERS_PENDING_INTERVAL", "30s")
+	if _, err := loadConfig(); err != nil {
+		t.Fatalf("loadConfig refused 30s: %v", err)
 	}
 }
