@@ -3,6 +3,7 @@ package sweepers_test
 import (
 	"bytes"
 	"encoding/json"
+	"log"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -53,13 +54,41 @@ func (b *syncBuffer) String() string {
 }
 
 // captureDefaultLog routes slog.Default to a buffer for one test.
+// slog.SetDefault also points the standard log package at the new
+// handler, and setting the default back does not undo that, so the log
+// output, flags and prefix are saved and restored too. Otherwise every
+// later log line in the package lands in this test's buffer.
 func captureDefaultLog(t *testing.T) *syncBuffer {
 	t.Helper()
 	buf := &syncBuffer{}
 	prev := slog.Default()
+	prevOut, prevFlags, prevPrefix := log.Writer(), log.Flags(), log.Prefix()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(buf, nil)))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+		log.SetPrefix(prevPrefix)
+	})
 	return buf
+}
+
+// After a test that captured the default log, the standard log package
+// writes where it did before, not into that test's buffer.
+func TestCaptureDefaultLog_RestoresLogOutput(t *testing.T) {
+	before := log.Writer()
+	var buf *syncBuffer
+	t.Run("capture", func(t *testing.T) {
+		buf = captureDefaultLog(t)
+		log.Print("inside")
+	})
+	if log.Writer() != before {
+		t.Fatal("log output still points at the captured logger")
+	}
+	log.Print("after the capture")
+	if strings.Contains(buf.String(), "after the capture") {
+		t.Fatal("a later log line landed in the captured buffer")
+	}
 }
 
 // webhookSecret stands in for the token a Slack-style incoming webhook
