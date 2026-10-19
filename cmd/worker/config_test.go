@@ -16,6 +16,7 @@ var durationVars = []string{
 	"SB_WORKER_DISCOVER_INTERVAL",
 	"SB_WORKER_REVEAL_SESSIONS_EXPIRED_INTERVAL",
 	"SB_WORKER_CROSS_TEAM_FILL_EXPIRED_INTERVAL",
+	"SB_WORKER_USERS_PENDING_INTERVAL",
 	"SB_WORKER_SECRETS_STALE_AFTER",
 	"SB_WORKER_AGENTS_STALE_AFTER",
 	"SB_WORKER_GITOPS_POLL_INTERVAL",
@@ -76,6 +77,27 @@ func TestLoadConfig_RejectsNonPositiveBatchSize(t *testing.T) {
 			_, err := loadConfig()
 			if err == nil || !strings.Contains(err.Error(), "SB_WORKER_GITOPS_BATCH_SIZE") {
 				t.Fatalf("err = %v want a SB_WORKER_GITOPS_BATCH_SIZE bounds error", err)
+			}
+		})
+	}
+}
+
+// The users-pending message links to <SB_PUBLIC_URL>/admin/users, so a
+// value that can't make a plain link stops the boot, like in the api.
+func TestLoadConfig_PublicURL(t *testing.T) {
+	t.Setenv("SB_PUBLIC_URL", "https://secrets.example.com/")
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.PublicURL != "https://secrets.example.com" {
+		t.Fatalf("PublicURL = %q, want the address without the trailing slash", cfg.PublicURL)
+	}
+	for _, bad := range []string{"secrets.example.com", "javascript:alert(1)", "https://user@secrets.example.com", "https://secrets.example.com/?x=1", "https://secrets.example.com/#x"} {
+		t.Run(bad, func(t *testing.T) {
+			t.Setenv("SB_PUBLIC_URL", bad)
+			if _, err := loadConfig(); err == nil || !strings.Contains(err.Error(), "SB_PUBLIC_URL") {
+				t.Fatalf("loadConfig(%q) = %v, want an error naming SB_PUBLIC_URL", bad, err)
 			}
 		})
 	}

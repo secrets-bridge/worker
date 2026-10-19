@@ -2,6 +2,7 @@ package notifications_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -61,6 +62,33 @@ func TestWebhook_SlackFormat(t *testing.T) {
 	}
 	if !strings.Contains(got, `"text"`) || !strings.Contains(got, "[warn] stale") {
 		t.Fatalf("slack body unexpected: %s", got)
+	}
+}
+
+// Slack reads <!channel>, <!here> and <url|label> in text, and & starts
+// an entity. Event text (a display name, an error) is escaped so it
+// can't ping everyone or dress up a link. A multi-line detail starts on
+// its own line.
+func TestWebhook_SlackEscapesAndKeepsLines(t *testing.T) {
+	var text string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var m map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&m)
+		text = m["text"]
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	wh := &notifications.Webhook{URL: srv.URL, HTTPClient: srv.Client(), FormatSlack: true}
+	if err := wh.Notify(t.Context(), notifications.Event{
+		Severity: notifications.SeverityInfo,
+		Title:    "R&D <!here>",
+		Detail:   "• <https://phish.example|Approve>\nand 2 more.",
+	}); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+	want := "[info] R&amp;D &lt;!here&gt;\n• &lt;https://phish.example|Approve&gt;\nand 2 more."
+	if text != want {
+		t.Fatalf("slack text = %q, want %q", text, want)
 	}
 }
 

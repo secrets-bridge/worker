@@ -50,10 +50,11 @@ type Pool = pgxpool.Pool
 // own outcome, but it is logged and counted: sweeper name, sink and
 // an error class only. The error text can carry the webhook URL (and
 // its secret path) and the event can carry ids, so neither is logged.
-// WRK-N-07.
-func notify(ctx context.Context, n notifications.Notifier, ev notifications.Event) {
+// WRK-N-07. It reports whether the event was delivered, for the
+// sweepers that only move on once it was.
+func notify(ctx context.Context, n notifications.Notifier, ev notifications.Event) bool {
 	if n == nil {
-		return
+		return false
 	}
 	if err := n.Notify(ctx, ev); err != nil {
 		notifyFailures.WithLabelValues(ev.Component).Inc()
@@ -62,5 +63,7 @@ func notify(ctx context.Context, n notifications.Notifier, ev notifications.Even
 			"sink", n.Name(),
 			"error_class", notifications.ErrorClass(err),
 		)
+		return false
 	}
+	return true
 }

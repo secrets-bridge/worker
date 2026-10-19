@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -25,7 +26,10 @@ import (
 //	}
 //
 // For Slack-incoming-webhook compatibility, set FormatSlack=true to
-// emit `{"text": "<title> — <detail>"}` instead.
+// emit `{"text": "<title> — <detail>"}` instead, with a multi-line
+// detail starting on its own line. Slack reads <...> as a mention or a
+// link, so &, < and > are escaped: text from an event (a display name,
+// an error) can't ping @channel or hide a link.
 type Webhook struct {
 	URL         string
 	HTTPClient  *http.Client // optional; defaults to a 10s-timeout client
@@ -89,9 +93,11 @@ func (w *Webhook) encode(event Event) ([]byte, error) {
 		event.Time = time.Now().UTC()
 	}
 	if w.FormatSlack {
-		return json.Marshal(map[string]string{
-			"text": fmt.Sprintf("[%s] %s — %s", event.Severity, event.Title, event.Detail),
-		})
+		text := fmt.Sprintf("[%s] %s — %s", event.Severity, event.Title, event.Detail)
+		if strings.Contains(event.Detail, "\n") {
+			text = fmt.Sprintf("[%s] %s\n%s", event.Severity, event.Title, event.Detail)
+		}
+		return json.Marshal(map[string]string{"text": slackEscape.Replace(text)})
 	}
 	return json.Marshal(struct {
 		Time      string         `json:"time"`
@@ -109,6 +115,10 @@ func (w *Webhook) encode(event Event) ([]byte, error) {
 		Metadata:  event.Metadata,
 	})
 }
+
+// slackEscape escapes the three characters Slack's text format gives a
+// meaning to.
+var slackEscape = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
 
 // StatusError signals a transient (retryable) non-2xx response.
 type StatusError struct{ Status int }

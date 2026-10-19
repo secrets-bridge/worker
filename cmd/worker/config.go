@@ -2,8 +2,10 @@ package main
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -39,6 +41,7 @@ type Config struct {
 	DiscoverInterval              time.Duration
 	RevealSessionsExpiredInterval time.Duration
 	CrossTeamFillExpiredInterval  time.Duration
+	UsersPendingInterval          time.Duration
 
 	// Cutoffs: how old a row must be before a sweeper flags it.
 	SecretsStaleAfter time.Duration
@@ -50,6 +53,12 @@ type Config struct {
 	// Notifications.
 	WebhookURL         string
 	WebhookSlackFormat bool
+
+	// PublicURL is SB_PUBLIC_URL, the address people open the console
+	// with, without a trailing slash. The users-pending message links
+	// to Admin → Users with it. Unset, the address saved in the console
+	// is used, as in the api.
+	PublicURL string
 
 	// GitOps observation poller (BRD §26). Opt-in via
 	// SB_WORKER_GITOPS_ENABLED=true so disabled deployments don't
@@ -89,12 +98,15 @@ func loadConfig() (Config, error) {
 		// Fill check rejects late writers anyway via
 		// ErrFillWindowExpired, so this sweeper is defense in depth.
 		CrossTeamFillExpiredInterval: 30 * time.Second,
-		SecretsStaleAfter:            24 * time.Hour,
-		AgentsStaleAfter:             5 * time.Minute,
-		GitOpsPollInterval:           15 * time.Second,
-		GitOpsTimeoutInterval:        1 * time.Minute,
-		GitOpsBatchSize:              20,
-		GitOpsHTTPTimeout:            15 * time.Second,
+		// One message per run at most, so this is also the most often
+		// admins hear about new accounts.
+		UsersPendingInterval:  1 * time.Minute,
+		SecretsStaleAfter:     24 * time.Hour,
+		AgentsStaleAfter:      5 * time.Minute,
+		GitOpsPollInterval:    15 * time.Second,
+		GitOpsTimeoutInterval: 1 * time.Minute,
+		GitOpsBatchSize:       20,
+		GitOpsHTTPTimeout:     15 * time.Second,
 	}
 
 	if v := os.Getenv("SB_WORKER_LOCAL_ADDR"); v != "" {
@@ -120,6 +132,7 @@ func loadConfig() (Config, error) {
 		{"SB_WORKER_DISCOVER_INTERVAL", &cfg.DiscoverInterval},
 		{"SB_WORKER_REVEAL_SESSIONS_EXPIRED_INTERVAL", &cfg.RevealSessionsExpiredInterval},
 		{"SB_WORKER_CROSS_TEAM_FILL_EXPIRED_INTERVAL", &cfg.CrossTeamFillExpiredInterval},
+		{"SB_WORKER_USERS_PENDING_INTERVAL", &cfg.UsersPendingInterval},
 		{"SB_WORKER_SECRETS_STALE_AFTER", &cfg.SecretsStaleAfter},
 		{"SB_WORKER_AGENTS_STALE_AFTER", &cfg.AgentsStaleAfter},
 		{"SB_WORKER_GITOPS_POLL_INTERVAL", &cfg.GitOpsPollInterval},
@@ -142,6 +155,13 @@ func loadConfig() (Config, error) {
 			return Config{}, fmt.Errorf("config: SB_WORKER_WEBHOOK_SLACK_FORMAT: %w", err)
 		}
 		cfg.WebhookSlackFormat = b
+	}
+	if v := os.Getenv("SB_PUBLIC_URL"); v != "" {
+		u, err := url.Parse(v)
+		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+			return Config{}, fmt.Errorf("config: SB_PUBLIC_URL must be an http(s) address with no user, query or fragment")
+		}
+		cfg.PublicURL = strings.TrimRight(v, "/")
 	}
 	if v := os.Getenv("SB_WORKER_GITOPS_ENABLED"); v != "" {
 		b, err := strconv.ParseBool(v)
@@ -183,6 +203,7 @@ func (c Config) validate() error {
 		{"SB_WORKER_DISCOVER_INTERVAL", c.DiscoverInterval},
 		{"SB_WORKER_REVEAL_SESSIONS_EXPIRED_INTERVAL", c.RevealSessionsExpiredInterval},
 		{"SB_WORKER_CROSS_TEAM_FILL_EXPIRED_INTERVAL", c.CrossTeamFillExpiredInterval},
+		{"SB_WORKER_USERS_PENDING_INTERVAL", c.UsersPendingInterval},
 		{"SB_WORKER_SECRETS_STALE_AFTER", c.SecretsStaleAfter},
 		{"SB_WORKER_AGENTS_STALE_AFTER", c.AgentsStaleAfter},
 		{"SB_WORKER_GITOPS_POLL_INTERVAL", c.GitOpsPollInterval},
