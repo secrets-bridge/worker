@@ -93,12 +93,24 @@ func TestLoadConfig_PublicURL(t *testing.T) {
 	if cfg.PublicURL != "https://secrets.example.com" {
 		t.Fatalf("PublicURL = %q, want the address without the trailing slash", cfg.PublicURL)
 	}
-	for in, want := range map[string]string{"http://localhost:5173/": "http://localhost:5173", "http://127.0.0.1:8080": "http://127.0.0.1:8080", " https://secrets.example.com/console/ ": "https://secrets.example.com/console"} {
+	t.Setenv("SB_PUBLIC_URL", " https://secrets.example.com/console/ ")
+	if cfg, err := loadConfig(); err != nil || cfg.PublicURL != "https://secrets.example.com/console" {
+		t.Errorf("loadConfig = %q, %v; want the normalized address", cfg.PublicURL, err)
+	}
+	// Plain http for localhost and loopback only with SB_ENV=dev, as in
+	// the api.
+	for in, want := range map[string]string{"http://localhost:5173/": "http://localhost:5173", "http://127.0.0.1:8080": "http://127.0.0.1:8080", "http://[::1]:8080": "http://[::1]:8080"} {
 		t.Setenv("SB_PUBLIC_URL", in)
+		t.Setenv("SB_ENV", ModeDev)
 		if cfg, err := loadConfig(); err != nil || cfg.PublicURL != want {
-			t.Errorf("loadConfig(%q) = %q, %v; want %q", in, cfg.PublicURL, err, want)
+			t.Errorf("loadConfig(%q) in dev = %q, %v; want %q", in, cfg.PublicURL, err, want)
+		}
+		t.Setenv("SB_ENV", ModeProduction)
+		if _, err := loadConfig(); err == nil || !strings.Contains(err.Error(), "SB_PUBLIC_URL") {
+			t.Errorf("loadConfig(%q) in production = %v; want an error naming SB_PUBLIC_URL", in, err)
 		}
 	}
+	t.Setenv("SB_ENV", "")
 	for _, bad := range []string{"secrets.example.com", "javascript:alert(1)", "http://secrets.example.com", "https://user@secrets.example.com", "https://secrets.example.com/?x=1", "https://secrets.example.com/#x"} {
 		t.Run(bad, func(t *testing.T) {
 			t.Setenv("SB_PUBLIC_URL", bad)

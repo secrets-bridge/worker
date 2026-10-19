@@ -159,7 +159,7 @@ func loadConfig() (Config, error) {
 		cfg.WebhookSlackFormat = b
 	}
 	if v := os.Getenv("SB_PUBLIC_URL"); v != "" {
-		u, err := normalizePublicURL(v)
+		u, err := normalizePublicURL(v, cfg.Env == ModeDev)
 		if err != nil {
 			return Config{}, fmt.Errorf("config: SB_PUBLIC_URL %w", err)
 		}
@@ -188,9 +188,9 @@ func loadConfig() (Config, error) {
 // normalizePublicURL is the api's rule for SB_PUBLIC_URL
 // (services.NormalizePublicURL), so a value the api accepts works here
 // and one it refuses stops the worker too: https, or plain http for
-// localhost or a loopback address only; no user, query or fragment; no
-// trailing slash.
-func normalizePublicURL(raw string) (string, error) {
+// localhost or a loopback address only with SB_ENV=dev (dev); no user,
+// query or fragment; no trailing slash.
+func normalizePublicURL(raw string, dev bool) (string, error) {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || u.Host == "" {
 		return "", errors.New("must be an absolute address such as https://secrets.example.com")
@@ -200,9 +200,9 @@ func normalizePublicURL(raw string) (string, error) {
 	loopback := host == "localhost" || (ip != nil && ip.IsLoopback())
 	switch {
 	case u.Scheme == "https":
-	case u.Scheme == "http" && loopback:
+	case u.Scheme == "http" && loopback && dev:
 	default:
-		return "", errors.New("must use https (http is allowed for localhost only)")
+		return "", errors.New("must use https (http is allowed for localhost with SB_ENV=dev only)")
 	}
 	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return "", errors.New("must not carry user info, a query or a fragment")

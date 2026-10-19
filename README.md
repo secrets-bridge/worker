@@ -69,7 +69,7 @@ Each sweeper:
 | `SB_WORKER_WEBHOOK_URL` | (unset) | If set, notifications go to this URL |
 | `SB_WORKER_WEBHOOK_SLACK_FORMAT` | `false` | Use Slack's `{"text": ...}` shape |
 | `SB_WORKER_USERS_PENDING_INTERVAL` | `1m` | How often `users-pending` looks for new waiting accounts; at most one message per run. At least `30s` |
-| `SB_PUBLIC_URL` | (unset) | The address people open the console with, for the link in the `users-pending` message. Unset, the address saved in the console is used. Same variable and rule as the api's: `https://`, or `http://` for localhost only |
+| `SB_PUBLIC_URL` | (unset) | The address people open the console with, for the link in the `users-pending` message. Unset, the address saved in the console is used. Same variable and rule as the api's: `https://`, or `http://` for localhost only with `SB_ENV=dev` |
 | `SB_WORKER_GITOPS_ENABLED` | `false` | Opt-in for the GitOps observation poller + timeout sweeper (BRD §26). Must match api's `SB_GITOPS_ENABLED`. When enabled, requires a configured `KeyManager` (`SB_KMS_BACKEND` etc.) to unwrap stored ArgoCD tokens. |
 | `SB_WORKER_GITOPS_POLL_INTERVAL` | `15s` | Tick cadence of the gitops-poller sweeper |
 | `SB_WORKER_GITOPS_TIMEOUT_INTERVAL` | `1m` | Tick cadence of the gitops-timeout sweeper |
