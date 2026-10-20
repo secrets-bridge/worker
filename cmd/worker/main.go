@@ -57,6 +57,19 @@ func revealSessionsRetry() retry.Policy {
 	}
 }
 
+// gatewaySweepersRetry bounds the retries inside one tick of the
+// gateway observation sweepers. Each one redoes any missed work on its
+// next tick (seconds to a minute away), so DefaultPolicy's backoff of up
+// to an hour would only hold the sweeper lock and stall later ticks
+// after a database blip.
+func gatewaySweepersRetry() retry.Policy {
+	return retry.Policy{
+		InitialDelay: 500 * time.Millisecond,
+		MaxDelay:     2 * time.Second,
+		MaxAttempts:  3,
+	}
+}
+
 func main() {
 	cfg, err := loadConfig()
 	if err != nil {
@@ -274,6 +287,23 @@ func main() {
 	} else {
 		logger.Info("gitops observation poller disabled (set SB_WORKER_GITOPS_ENABLED=true to enable)")
 	}
+	// Gateway observation sweepers (worker#38). OFF by default; turn on
+	// with SB_WORKER_GATEWAY_SWEEPERS_ENABLED=true together with the
+	// api's SB_GATEWAY_ENABLED.
+	if cfg.GatewaySweepersEnabled {
+		registerGatewaySweepers(sched, cfg, pool, auditRepo, notifier)
+		logger.Info("gateway observation sweepers enabled",
+			"leases_interval", cfg.ObservationLeasesInterval,
+			"deadlines_interval", cfg.ObservationDeadlinesInterval,
+			"stale_interval", cfg.GatewaysStaleInterval,
+			"stale_after", cfg.GatewaysStaleAfter,
+			"replicas_prune_interval", cfg.GatewayReplicasPruneInterval,
+			"replicas_retention", cfg.GatewayReplicasRetention,
+		)
+	} else {
+		logger.Info("gateway observation sweepers disabled (set SB_WORKER_GATEWAY_SWEEPERS_ENABLED=true to enable)")
+	}
+
 	// Slice P4: DB-backed discover scheduler. Reads from
 	// provider_connections via api/pkg/storage; the env-var path
 	// (SB_DISCOVER_TARGETS_JSON) is now a deprecated fallback used
@@ -324,4 +354,37 @@ func main() {
 	defer cancel()
 	_ = probeSrv.Shutdown(shutdownCtx)
 	logger.Info("shutdown complete")
+}
+
+// registerGatewaySweepers registers the four gateway observation
+// sweepers, each under its own Redis lock.
+func registerGatewaySweepers(sched *scheduler.Scheduler, cfg Config, pool *storage.Pool, audit *storage.AuditEvents, notifier notifications.Notifier) {
+	tasks := storage.NewObservationTasks(pool)
+	clock := sweepers.DBClock{Pool: pool}.Now
+	sched.Register(scheduler.TaskRegistration{
+		Task: sweepers.ObservationLeases{
+			Store: tasks, Audit: audit, Notifier: notifier, Clock: clock, BatchSize: cfg.ObservationBatchSize,
+		},
+		Interval: cfg.ObservationLeasesInterval,
+		Retry:    gatewaySweepersRetry(),
+	})
+	sched.Register(scheduler.TaskRegistration{
+		Task: sweepers.ObservationDeadlines{
+			Store: tasks, Audit: audit, Notifier: notifier, Clock: clock, BatchSize: cfg.ObservationBatchSize,
+		},
+		Interval: cfg.ObservationDeadlinesInterval,
+		Retry:    gatewaySweepersRetry(),
+	})
+	sched.Register(scheduler.TaskRegistration{
+		Task: sweepers.GatewaysStale{
+			Pool: pool, StaleAfter: cfg.GatewaysStaleAfter, Audit: audit, Notifier: notifier,
+		},
+		Interval: cfg.GatewaysStaleInterval,
+		Retry:    gatewaySweepersRetry(),
+	})
+	sched.Register(scheduler.TaskRegistration{
+		Task:     sweepers.GatewayReplicasPrune{Pool: pool, Retention: cfg.GatewayReplicasRetention},
+		Interval: cfg.GatewayReplicasPruneInterval,
+		Retry:    gatewaySweepersRetry(),
+	})
 }

@@ -27,6 +27,7 @@ The Secrets Bridge background worker. It runs periodic sweepers against the cont
 | `jobs_recovery` | Flags jobs stuck in a claimed state |
 | `discover_scheduler` | Enqueues discovery jobs |
 | `gitops_poller`, `gitops_timeout` | Optional read-only ArgoCD observation; enable with `SB_WORKER_GITOPS_ENABLED` (must match the api setting) |
+| `observation_tasks` (`observation-leases`, `observation-deadlines`), `gateways_stale` (`gateways-stale`, `gateway-replicas-prune`) | Gateway observation queue upkeep: requeue expired leases, time out tasks past their deadline (never failed), flag quiet Gateways stale, prune old replica rows. Enable with `SB_WORKER_GATEWAY_SWEEPERS_ENABLED` (turn on with the api's `SB_GATEWAY_ENABLED`) |
 | `users_pending` | One webhook message per run for accounts that started waiting for approval; only with a webhook |
 
 ## Build and test
@@ -42,7 +43,7 @@ go mod tidy   # CI fails on a diff
 
 ## Configuration
 
-`DATABASE_URL`, `REDIS_URL`, `SB_ENV`, one `SB_WORKER_<SWEEPER>_INTERVAL` per sweeper, `SB_WORKER_SECRETS_STALE_AFTER`, `SB_WORKER_AGENTS_STALE_AFTER`, optional `SB_WORKER_WEBHOOK_URL`, optional `SB_PUBLIC_URL` (the link in the `users_pending` message).
+`DATABASE_URL`, `REDIS_URL`, `SB_ENV`, one `SB_WORKER_<SWEEPER>_INTERVAL` per sweeper, `SB_WORKER_SECRETS_STALE_AFTER`, `SB_WORKER_AGENTS_STALE_AFTER`, the Gateway sweeper knobs (`SB_WORKER_GATEWAY_SWEEPERS_ENABLED`, `SB_WORKER_GATEWAYS_STALE_AFTER`, `SB_WORKER_GATEWAY_REPLICAS_RETENTION`, `SB_WORKER_OBSERVATION_BATCH_SIZE`; floors in `cmd/worker/config.go`, table in the README), optional `SB_WORKER_WEBHOOK_URL`, optional `SB_PUBLIC_URL` (the link in the `users_pending` message).
 
 ## Rules for this repo
 
@@ -52,6 +53,8 @@ go mod tidy   # CI fails on a diff
 - No provider SDKs here. Anything that touches a provider runs in the agent.
 - A losing lock is normal (N-1 replicas skip each tick); count it in metrics, do not log it as a warning.
 - If a change needs a new query or table in `api`, land the `api` PR first.
+- Lock order with the api: a sweeper that locks a `gateways` row and observation tasks together locks the Gateway row first (`FOR NO KEY UPDATE` or `FOR SHARE`), as every api path does. `ExpireLeases` and `ExpireDeadlines` lock task rows only.
+- Postgres tests run when `TEST_DATABASE_URL` is set, Redis ones when `TEST_REDIS_URL` is set (both in CI). Run them with `-p 1`: the Postgres tests wipe shared tables.
 
 ## Contributing
 

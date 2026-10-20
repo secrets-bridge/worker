@@ -73,7 +73,38 @@ type Config struct {
 	GitOpsTimeoutInterval time.Duration // default 1m for the timeout sweeper
 	GitOpsBatchSize       int           // observations per tick; default 20
 	GitOpsHTTPTimeout     time.Duration // per-ArgoCD-call ceiling; default 15s
+
+	// Gateway observation sweepers (worker#38): observation-leases,
+	// observation-deadlines, gateways-stale and gateway-replicas-prune.
+	// Opt-in via SB_WORKER_GATEWAY_SWEEPERS_ENABLED=true, to be turned
+	// on with the api's SB_GATEWAY_ENABLED. Off, the gateway and
+	// observation tables are never touched.
+	GatewaySweepersEnabled       bool
+	ObservationLeasesInterval    time.Duration // default 30s
+	ObservationDeadlinesInterval time.Duration // default 30s
+	ObservationBatchSize         int           // rows per statement; default 200
+	GatewaysStaleInterval        time.Duration // default 1m
+	GatewaysStaleAfter           time.Duration // default 2m (four missed 30s heartbeats)
+	GatewayReplicasPruneInterval time.Duration // default 1h
+	GatewayReplicasRetention     time.Duration // default 24h
 }
+
+// Floors for the gateway sweepers. The Gateway heartbeats every 30s
+// (api gatewayHeartbeatIntervalSec), so a stale cutoff under a minute
+// would flag a healthy Gateway after one late heartbeat. The api counts
+// replicas seen within the last 10 minutes towards max_replicas
+// (services.GatewayReplicaWindow); pruning inside that window would let
+// a Gateway exceed the cap. The interval floors keep the sweeps from
+// hammering Postgres.
+const (
+	minObservationSweepInterval    = 5 * time.Second
+	minGatewaysStaleInterval       = 10 * time.Second
+	minGatewaysStaleAfter          = time.Minute
+	minGatewayReplicasPruneEvery   = time.Minute
+	minGatewayReplicasRetention    = 10 * time.Minute
+	maxObservationBatchSize        = 1000
+	defaultObservationBatchSizeCfg = 200
+)
 
 // loadConfig reads the env vars and applies defaults. Returns an
 // error only for malformed values; missing optional vars take
@@ -109,6 +140,14 @@ func loadConfig() (Config, error) {
 		GitOpsTimeoutInterval: 1 * time.Minute,
 		GitOpsBatchSize:       20,
 		GitOpsHTTPTimeout:     15 * time.Second,
+
+		ObservationLeasesInterval:    30 * time.Second,
+		ObservationDeadlinesInterval: 30 * time.Second,
+		ObservationBatchSize:         defaultObservationBatchSizeCfg,
+		GatewaysStaleInterval:        time.Minute,
+		GatewaysStaleAfter:           2 * time.Minute,
+		GatewayReplicasPruneInterval: time.Hour,
+		GatewayReplicasRetention:     24 * time.Hour,
 	}
 
 	if v := os.Getenv("SB_WORKER_LOCAL_ADDR"); v != "" {
@@ -140,6 +179,12 @@ func loadConfig() (Config, error) {
 		{"SB_WORKER_GITOPS_POLL_INTERVAL", &cfg.GitOpsPollInterval},
 		{"SB_WORKER_GITOPS_TIMEOUT_INTERVAL", &cfg.GitOpsTimeoutInterval},
 		{"SB_WORKER_GITOPS_HTTP_TIMEOUT", &cfg.GitOpsHTTPTimeout},
+		{"SB_WORKER_OBSERVATION_LEASES_INTERVAL", &cfg.ObservationLeasesInterval},
+		{"SB_WORKER_OBSERVATION_DEADLINES_INTERVAL", &cfg.ObservationDeadlinesInterval},
+		{"SB_WORKER_GATEWAYS_STALE_INTERVAL", &cfg.GatewaysStaleInterval},
+		{"SB_WORKER_GATEWAYS_STALE_AFTER", &cfg.GatewaysStaleAfter},
+		{"SB_WORKER_GATEWAY_REPLICAS_PRUNE_INTERVAL", &cfg.GatewayReplicasPruneInterval},
+		{"SB_WORKER_GATEWAY_REPLICAS_RETENTION", &cfg.GatewayReplicasRetention},
 	} {
 		if v := os.Getenv(b.env); v != "" {
 			d, err := time.ParseDuration(v)
@@ -178,6 +223,20 @@ func loadConfig() (Config, error) {
 			return Config{}, fmt.Errorf("config: SB_WORKER_GITOPS_BATCH_SIZE: %w", err)
 		}
 		cfg.GitOpsBatchSize = n
+	}
+	if v := os.Getenv("SB_WORKER_GATEWAY_SWEEPERS_ENABLED"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("config: SB_WORKER_GATEWAY_SWEEPERS_ENABLED: %w", err)
+		}
+		cfg.GatewaySweepersEnabled = b
+	}
+	if v := os.Getenv("SB_WORKER_OBSERVATION_BATCH_SIZE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("config: SB_WORKER_OBSERVATION_BATCH_SIZE: %w", err)
+		}
+		cfg.ObservationBatchSize = n
 	}
 	if err := cfg.validate(); err != nil {
 		return Config{}, err
@@ -240,6 +299,12 @@ func (c Config) validate() error {
 		{"SB_WORKER_GITOPS_POLL_INTERVAL", c.GitOpsPollInterval},
 		{"SB_WORKER_GITOPS_TIMEOUT_INTERVAL", c.GitOpsTimeoutInterval},
 		{"SB_WORKER_GITOPS_HTTP_TIMEOUT", c.GitOpsHTTPTimeout},
+		{"SB_WORKER_OBSERVATION_LEASES_INTERVAL", c.ObservationLeasesInterval},
+		{"SB_WORKER_OBSERVATION_DEADLINES_INTERVAL", c.ObservationDeadlinesInterval},
+		{"SB_WORKER_GATEWAYS_STALE_INTERVAL", c.GatewaysStaleInterval},
+		{"SB_WORKER_GATEWAYS_STALE_AFTER", c.GatewaysStaleAfter},
+		{"SB_WORKER_GATEWAY_REPLICAS_PRUNE_INTERVAL", c.GatewayReplicasPruneInterval},
+		{"SB_WORKER_GATEWAY_REPLICAS_RETENTION", c.GatewayReplicasRetention},
 	} {
 		if d.val <= 0 {
 			return fmt.Errorf("config: %s must be greater than zero (got %s)", d.env, d.val)
@@ -247,6 +312,24 @@ func (c Config) validate() error {
 	}
 	if c.UsersPendingInterval < minUsersPendingInterval {
 		return fmt.Errorf("config: SB_WORKER_USERS_PENDING_INTERVAL must be at least %s (got %s)", minUsersPendingInterval, c.UsersPendingInterval)
+	}
+	for _, f := range []struct {
+		env      string
+		val, min time.Duration
+	}{
+		{"SB_WORKER_OBSERVATION_LEASES_INTERVAL", c.ObservationLeasesInterval, minObservationSweepInterval},
+		{"SB_WORKER_OBSERVATION_DEADLINES_INTERVAL", c.ObservationDeadlinesInterval, minObservationSweepInterval},
+		{"SB_WORKER_GATEWAYS_STALE_INTERVAL", c.GatewaysStaleInterval, minGatewaysStaleInterval},
+		{"SB_WORKER_GATEWAYS_STALE_AFTER", c.GatewaysStaleAfter, minGatewaysStaleAfter},
+		{"SB_WORKER_GATEWAY_REPLICAS_PRUNE_INTERVAL", c.GatewayReplicasPruneInterval, minGatewayReplicasPruneEvery},
+		{"SB_WORKER_GATEWAY_REPLICAS_RETENTION", c.GatewayReplicasRetention, minGatewayReplicasRetention},
+	} {
+		if f.val < f.min {
+			return fmt.Errorf("config: %s must be at least %s (got %s)", f.env, f.min, f.val)
+		}
+	}
+	if c.ObservationBatchSize < 1 || c.ObservationBatchSize > maxObservationBatchSize {
+		return fmt.Errorf("config: SB_WORKER_OBSERVATION_BATCH_SIZE must be between 1 and %d (got %d)", maxObservationBatchSize, c.ObservationBatchSize)
 	}
 	if c.GitOpsBatchSize < 1 {
 		return fmt.Errorf("config: SB_WORKER_GITOPS_BATCH_SIZE must be at least 1 (got %d)", c.GitOpsBatchSize)
