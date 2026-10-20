@@ -38,6 +38,14 @@ func testPool(t *testing.T) *storage.Pool {
 	const truncate = `
 		TRUNCATE TABLE
 			audit_events,
+			observation_evidence,
+			observation_task_attempts,
+			observation_tasks,
+			gateway_connector_bindings,
+			gateway_connectors,
+			gateway_replicas,
+			gateway_enrollment_tokens,
+			gateways,
 			reveal_sessions,
 			secret_wraps,
 			gitops_observations,

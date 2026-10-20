@@ -22,6 +22,18 @@ var durationVars = []string{
 	"SB_WORKER_GITOPS_POLL_INTERVAL",
 	"SB_WORKER_GITOPS_TIMEOUT_INTERVAL",
 	"SB_WORKER_GITOPS_HTTP_TIMEOUT",
+	"SB_WORKER_OBSERVATION_LEASES_INTERVAL",
+	"SB_WORKER_OBSERVATION_DEADLINES_INTERVAL",
+	"SB_WORKER_GATEWAYS_STALE_INTERVAL",
+	"SB_WORKER_GATEWAYS_STALE_AFTER",
+	"SB_WORKER_GATEWAY_REPLICAS_PRUNE_INTERVAL",
+	"SB_WORKER_GATEWAY_REPLICAS_RETENTION",
+}
+
+// floorVars are the duration knobs with a floor above 90s, which the
+// override test sets to a value that clears it.
+var floorVars = map[string]string{
+	"SB_WORKER_GATEWAY_REPLICAS_RETENTION": "15m",
 }
 
 func TestLoadConfig_DefaultsAreValid(t *testing.T) {
@@ -36,14 +48,20 @@ func TestLoadConfig_DefaultsAreValid(t *testing.T) {
 
 func TestLoadConfig_PositiveOverridesAccepted(t *testing.T) {
 	for _, name := range durationVars {
+		if v, ok := floorVars[name]; ok {
+			t.Setenv(name, v)
+			continue
+		}
 		t.Setenv(name, "90s")
 	}
 	t.Setenv("SB_WORKER_GITOPS_BATCH_SIZE", "5")
+	t.Setenv("SB_WORKER_OBSERVATION_BATCH_SIZE", "50")
 	cfg, err := loadConfig()
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
-	if cfg.AgentsStaleAfter != 90*time.Second || cfg.GitOpsHTTPTimeout != 90*time.Second || cfg.GitOpsBatchSize != 5 {
+	if cfg.AgentsStaleAfter != 90*time.Second || cfg.GitOpsHTTPTimeout != 90*time.Second || cfg.GitOpsBatchSize != 5 ||
+		cfg.GatewaysStaleAfter != 90*time.Second || cfg.GatewayReplicasRetention != 15*time.Minute || cfg.ObservationBatchSize != 50 {
 		t.Fatalf("overrides not applied: %+v", cfg)
 	}
 }
@@ -130,5 +148,64 @@ func TestLoadConfig_UsersPendingIntervalFloor(t *testing.T) {
 	t.Setenv("SB_WORKER_USERS_PENDING_INTERVAL", "30s")
 	if _, err := loadConfig(); err != nil {
 		t.Fatalf("loadConfig refused 30s: %v", err)
+	}
+}
+
+// The gateway sweepers are off unless asked for, and their defaults are
+// the documented ones.
+func TestLoadConfig_GatewaySweepersDefaults(t *testing.T) {
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.GatewaySweepersEnabled {
+		t.Fatal("gateway sweepers on by default")
+	}
+	if cfg.ObservationLeasesInterval != 30*time.Second || cfg.ObservationDeadlinesInterval != 30*time.Second ||
+		cfg.GatewaysStaleInterval != time.Minute || cfg.GatewaysStaleAfter != 2*time.Minute ||
+		cfg.GatewayReplicasPruneInterval != time.Hour || cfg.GatewayReplicasRetention != 24*time.Hour ||
+		cfg.ObservationBatchSize != 200 {
+		t.Fatalf("gateway sweeper defaults changed: %+v", cfg)
+	}
+	t.Setenv("SB_WORKER_GATEWAY_SWEEPERS_ENABLED", "true")
+	if cfg, err := loadConfig(); err != nil || !cfg.GatewaySweepersEnabled {
+		t.Fatalf("enable = %v, %v", cfg.GatewaySweepersEnabled, err)
+	}
+	t.Setenv("SB_WORKER_GATEWAY_SWEEPERS_ENABLED", "maybe")
+	if _, err := loadConfig(); err == nil || !strings.Contains(err.Error(), "SB_WORKER_GATEWAY_SWEEPERS_ENABLED") {
+		t.Fatalf("bad bool accepted: %v", err)
+	}
+}
+
+// Below the floor a gateway knob stops the boot, at the floor it is
+// accepted. A stale cutoff under two heartbeats or a retention inside
+// the api's replica window would misbehave quietly.
+func TestLoadConfig_GatewaySweeperFloors(t *testing.T) {
+	for name, c := range map[string]struct{ below, at string }{
+		"SB_WORKER_OBSERVATION_LEASES_INTERVAL":     {"4s", "5s"},
+		"SB_WORKER_OBSERVATION_DEADLINES_INTERVAL":  {"4s", "5s"},
+		"SB_WORKER_GATEWAYS_STALE_INTERVAL":         {"9s", "10s"},
+		"SB_WORKER_GATEWAYS_STALE_AFTER":            {"59s", "1m"},
+		"SB_WORKER_GATEWAY_REPLICAS_PRUNE_INTERVAL": {"59s", "1m"},
+		"SB_WORKER_GATEWAY_REPLICAS_RETENTION":      {"9m", "10m"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(name, c.below)
+			if _, err := loadConfig(); err == nil || !strings.Contains(err.Error(), name) {
+				t.Fatalf("%s=%s accepted: %v", name, c.below, err)
+			}
+			t.Setenv(name, c.at)
+			if _, err := loadConfig(); err != nil {
+				t.Fatalf("%s=%s refused: %v", name, c.at, err)
+			}
+		})
+	}
+	for _, bad := range []string{"0", "-1", "1001", "x"} {
+		t.Run("batch="+bad, func(t *testing.T) {
+			t.Setenv("SB_WORKER_OBSERVATION_BATCH_SIZE", bad)
+			if _, err := loadConfig(); err == nil || !strings.Contains(err.Error(), "SB_WORKER_OBSERVATION_BATCH_SIZE") {
+				t.Fatalf("batch %s accepted: %v", bad, err)
+			}
+		})
 	}
 }

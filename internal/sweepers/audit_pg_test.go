@@ -22,6 +22,9 @@ var auditMetadataKeys = map[string]bool{
 	"sweeper": true, "reason": true, "request_id": true, "state": true,
 	"job_type": true, "stale_after_seconds": true, "wrap_count": true,
 	"wraps_expired": true, "wraps_already_closed": true, "wrap_errors": true,
+	// gateway observation sweepers (worker#38)
+	"task_id": true, "gateway_id": true, "task_state": true, "verdict": true,
+	"verdict_reason": true, "attempt_count": true, "failure_count": true,
 }
 
 // auditRows returns every audit_events row, oldest first.

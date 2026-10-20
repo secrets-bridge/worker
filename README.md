@@ -42,6 +42,10 @@ The worker imports `github.com/secrets-bridge/api/pkg/{storage,runtime}` per the
 | `gitops-poller` | Poll ArgoCD per active observation, record observed_state, transition terminal states (applied / failed) | 15s | none (opt-in via `SB_WORKER_GITOPS_ENABLED`) |
 | `gitops-timeout` | Flip rows past `timeout_at` to `applied_unverified` | 1m | none (opt-in via `SB_WORKER_GITOPS_ENABLED`) |
 | `users-pending` | Post one webhook message for accounts that started waiting for approval (below) | 1m | none (only with `SB_WORKER_WEBHOOK_URL`) |
+| `observation-leases` | Put Gateway observation tasks whose lease ended back to `queued` (below) | 30s | none (opt-in via `SB_WORKER_GATEWAY_SWEEPERS_ENABLED`) |
+| `observation-deadlines` | Close open observation tasks past `deadline_at` as `timed_out` | 30s | none (opt-in) |
+| `gateways-stale` | Flip Gateways from `active` to `stale` after missed heartbeats | 1m | 2m (opt-in) |
+| `gateway-replicas-prune` | Delete `gateway_replicas` rows not seen within the retention | 1h | 24h (opt-in) |
 
 Each sweeper:
 - Runs under a Redis lock (`worker:sweeper:<name>`), so with multiple replicas only one runs per tick.
@@ -75,9 +79,28 @@ Each sweeper:
 | `SB_WORKER_GITOPS_TIMEOUT_INTERVAL` | `1m` | Tick cadence of the gitops-timeout sweeper |
 | `SB_WORKER_GITOPS_BATCH_SIZE` | `20` | Max observations claimed per gitops-poller tick |
 | `SB_WORKER_GITOPS_HTTP_TIMEOUT` | `15s` | Per-ArgoCD-call HTTP timeout |
+| `SB_WORKER_GATEWAY_SWEEPERS_ENABLED` | `false` | Opt-in for the four Gateway observation sweepers. Turn it on together with the api's `SB_GATEWAY_ENABLED`. Off, the gateway and observation tables are never read |
+| `SB_WORKER_OBSERVATION_LEASES_INTERVAL` | `30s` | Tick of `observation-leases`. At least `5s` |
+| `SB_WORKER_OBSERVATION_DEADLINES_INTERVAL` | `30s` | Tick of `observation-deadlines`. At least `5s` |
+| `SB_WORKER_OBSERVATION_BATCH_SIZE` | `200` | Tasks per statement; a tick runs up to 10 batches. 1 to 1000 |
+| `SB_WORKER_GATEWAYS_STALE_INTERVAL` | `1m` | Tick of `gateways-stale`. At least `10s` |
+| `SB_WORKER_GATEWAYS_STALE_AFTER` | `2m` | Flip cutoff: four missed 30s heartbeats. At least `1m` |
+| `SB_WORKER_GATEWAY_REPLICAS_PRUNE_INTERVAL` | `1h` | Tick of `gateway-replicas-prune`. At least `1m` |
+| `SB_WORKER_GATEWAY_REPLICAS_RETENTION` | `24h` | Replica rows not seen for this long are deleted. At least `10m`, the api's replica-limit window |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 
-Every duration above must be greater than zero and `SB_WORKER_GITOPS_BATCH_SIZE` at least 1. Anything else stops the worker at boot with an error naming the variable.
+Every duration above must be greater than zero, `SB_WORKER_GITOPS_BATCH_SIZE` at least 1, and the Gateway knobs at or above their floors. Anything else stops the worker at boot with an error naming the variable. The floors are checked even while the Gateway sweepers are off, so turning them on later can't surface a bad value.
+
+### Gateway observation sweepers
+
+The Gateway observation queue lives in the api (`observation_tasks`, api#294). These sweepers clean up after a Gateway that stops calling in or a replica that dies:
+
+- **`observation-leases`** calls `ExpireLeases`: a leased task whose lease ended goes back to `queued` with no attempt, and the attempt is closed as `lease_expired`. A late renew, release or result from that attempt is then refused by the api's attempt fence. `failure_count` is not touched, so replica restarts can't kill a healthy task; the deadline bounds the churn. Audit: `observation.task.lease_expired` per task.
+- **`observation-deadlines`** calls `ExpireDeadlines`: an open task past `deadline_at` becomes `done` with verdict `timed_out` and reason `deadline_reached`, or `gateway_unavailable` when its Gateway was not seen since the task was created or is not active. It is never `dead` or failed: timed out means "not observed in time", not a failed deployment. Audit: `observation.task.timed_out` per task.
+- **`gateways-stale`** flips an `active` Gateway to `stale` once its `last_seen_at` (or `enrolled_at`, if it never sent a heartbeat) is older than `SB_WORKER_GATEWAYS_STALE_AFTER`. The Gateway keeps its credential and can still call in; the api flips it back to `active` on the next accepted heartbeat. Audit: `gateway.stale` per Gateway.
+- **`gateway-replicas-prune`** deletes old `gateway_replicas` rows. No audit row: a replica row is a heartbeat cache.
+
+The task sweeps lock task rows only (`FOR UPDATE SKIP LOCKED`). The Gateway sweeps lock Gateway rows first (`FOR NO KEY UPDATE` / `FOR SHARE`, `SKIP LOCKED`), the same order the api uses, so a sweep never deadlocks with a claim, result, heartbeat or revoke. Times are judged on the database clock, the clock the api writes leases and deadlines with. Each tick retries at most 3 times (a few seconds): the next tick redoes any missed work. Metrics: `worker_observation_task_leases_expired_total`, `worker_observation_tasks_timed_out_total{reason}`, `worker_gateways_stale_total`, `worker_gateway_replicas_pruned_total`. Logs and notifications carry counts only.
 
 ### Accounts waiting for approval
 
@@ -151,5 +174,6 @@ go run ./cmd/worker
 |---|---|---|
 | Step 11 ([#1](https://github.com/secrets-bridge/worker/issues/1)) | Scaffold + retry + notifications + scheduler + 5 sweepers (wraps-expired / secrets-stale / agents-stale / jobs-recovery / discover-scheduler) | ✅ merged |
 | BRD §26 GitOps poller ([#3](https://github.com/secrets-bridge/worker/pull/3)) | `gitops-poller` (15 s) + `gitops-timeout` (1 m) sweepers; opt-in via `SB_WORKER_GITOPS_ENABLED=true`, must match api's `SB_GITOPS_ENABLED` | ✅ merged |
+| Gateway R1 ([#38](https://github.com/secrets-bridge/worker/issues/38)) | `observation-leases`, `observation-deadlines`, `gateways-stale`, `gateway-replicas-prune`; opt-in via `SB_WORKER_GATEWAY_SWEEPERS_ENABLED=true` | in review |
 
 See [`skills/PROGRESS.md`](https://github.com/secrets-bridge/skills/blob/main/PROGRESS.md) for the slice-by-slice log.
