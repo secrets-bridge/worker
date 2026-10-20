@@ -26,8 +26,7 @@ The Secrets Bridge background worker. It runs periodic sweepers against the cont
 | `agents_stale` | Marks agents stale after missed heartbeats |
 | `jobs_recovery` | Flags jobs stuck in a claimed state |
 | `discover_scheduler` | Enqueues discovery jobs |
-| `gitops_poller`, `gitops_timeout` | Optional read-only ArgoCD observation; enable with `SB_WORKER_GITOPS_ENABLED` (must match the api setting) |
-| `observation_tasks` (`observation-leases`, `observation-deadlines`), `gateways_stale` (`gateways-stale`, `gateway-replicas-prune`) | Gateway observation queue upkeep: requeue expired leases, time out tasks past their deadline (never failed), flag quiet Gateways stale, prune old replica rows. Enable with `SB_WORKER_GATEWAY_SWEEPERS_ENABLED` (turn on with the api's `SB_GATEWAY_ENABLED`) |
+| `observation_tasks` (`observation-leases`, `observation-deadlines`), `gateways_stale` (`gateways-stale`, `gateway-replicas-prune`) | Gateway observation queue upkeep: requeue expired leases, time out tasks past their deadline (never failed), flag quiet Gateways stale, prune old replica rows. Enable with `SB_WORKER_GATEWAY_SWEEPERS_ENABLED`; needed whenever any environment's observation source is `gateway` |
 | `users_pending` | One webhook message per run for accounts that started waiting for approval; only with a webhook |
 
 ## Build and test
@@ -51,6 +50,7 @@ go mod tidy   # CI fails on a diff
 - Sweepers must be idempotent and safe to run concurrently with other replicas.
 - Never log, audit or notify secret values, tokens or row contents. Report counts, cutoffs and sweeper names. The one exception is `users_pending`, which lists the waiting accounts' emails in its webhook message (api#265). It sends to the webhook alone, never the log sink, and never includes display names.
 - No provider SDKs here. Anything that touches a provider runs in the agent.
+- No Argo CD client here. The Gateway is the only component that talks to Argo CD (gateway#13). `internal/archguard` fails on an import of an Argo CD package or an Argo CD API path in non-test code. `SB_WORKER_GITOPS_*` are retired settings: logged by name if set, never a switch.
 - A losing lock is normal (N-1 replicas skip each tick); count it in metrics, do not log it as a warning.
 - If a change needs a new query or table in `api`, land the `api` PR first.
 - Lock order with the api: a sweeper that locks a `gateways` row and observation tasks together locks the Gateway row first (`FOR NO KEY UPDATE` or `FOR SHARE`), as every api path does. `ExpireLeases` and `ExpireDeadlines` lock task rows only.

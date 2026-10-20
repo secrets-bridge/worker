@@ -39,8 +39,6 @@ The worker imports `github.com/secrets-bridge/api/pkg/{storage,runtime}` per the
 | `agents-stale` | Flip agents from `active` to `stale` when heartbeat has stopped | 1m | 5m |
 | `jobs-recovery` | Flip claimed sync_jobs to `expired` when claim_expires_at passed | 30s | none |
 | `discover-scheduler` | Enqueue one discover job per configured target every interval | 1h | none |
-| `gitops-poller` | Poll ArgoCD per active observation, record observed_state, transition terminal states (applied / failed) | 15s | none (opt-in via `SB_WORKER_GITOPS_ENABLED`) |
-| `gitops-timeout` | Flip rows past `timeout_at` to `applied_unverified` | 1m | none (opt-in via `SB_WORKER_GITOPS_ENABLED`) |
 | `users-pending` | Post one webhook message for accounts that started waiting for approval (below) | 1m | none (only with `SB_WORKER_WEBHOOK_URL`) |
 | `observation-leases` | Put Gateway observation tasks whose lease ended back to `queued` (below) | 30s | none (opt-in via `SB_WORKER_GATEWAY_SWEEPERS_ENABLED`) |
 | `observation-deadlines` | Close open observation tasks past `deadline_at` as `timed_out` | 30s | none (opt-in) |
@@ -74,12 +72,7 @@ Each sweeper:
 | `SB_WORKER_WEBHOOK_SLACK_FORMAT` | `false` | Use Slack's `{"text": ...}` shape |
 | `SB_WORKER_USERS_PENDING_INTERVAL` | `1m` | How often `users-pending` looks for new waiting accounts; at most one message per run. At least `30s` |
 | `SB_PUBLIC_URL` | (unset) | The address people open the console with, for the link in the `users-pending` message. Unset, the address saved in the console is used. Same variable and rule as the api's: `https://`, or `http://` for localhost only with `SB_ENV=dev` |
-| `SB_WORKER_GITOPS_ENABLED` | `false` | Opt-in for the GitOps observation poller + timeout sweeper (BRD §26). Must match api's `SB_GITOPS_ENABLED`. When enabled, requires a configured `KeyManager` (`SB_KMS_BACKEND` etc.) to unwrap stored ArgoCD tokens. |
-| `SB_WORKER_GITOPS_POLL_INTERVAL` | `15s` | Tick cadence of the gitops-poller sweeper |
-| `SB_WORKER_GITOPS_TIMEOUT_INTERVAL` | `1m` | Tick cadence of the gitops-timeout sweeper |
-| `SB_WORKER_GITOPS_BATCH_SIZE` | `20` | Max observations claimed per gitops-poller tick |
-| `SB_WORKER_GITOPS_HTTP_TIMEOUT` | `15s` | Per-ArgoCD-call HTTP timeout |
-| `SB_WORKER_GATEWAY_SWEEPERS_ENABLED` | `false` | Opt-in for the four Gateway observation sweepers. Turn it on together with the api's `SB_GATEWAY_ENABLED`. Off, the gateway and observation tables are never read |
+| `SB_WORKER_GATEWAY_SWEEPERS_ENABLED` | `false` | Opt-in for the four Gateway observation sweepers. Needed whenever any environment's observation source is `gateway` (the api's Gateway routes are always mounted; there is no api switch). Off, the gateway and observation tables are never read, so leases and deadlines of Gateway tasks are not swept |
 | `SB_WORKER_OBSERVATION_LEASES_INTERVAL` | `30s` | Tick of `observation-leases`. At least `5s` |
 | `SB_WORKER_OBSERVATION_DEADLINES_INTERVAL` | `30s` | Tick of `observation-deadlines`. At least `5s` |
 | `SB_WORKER_OBSERVATION_BATCH_SIZE` | `200` | Tasks per statement; a tick runs up to 10 batches. 1 to 1000 |
@@ -89,7 +82,15 @@ Each sweeper:
 | `SB_WORKER_GATEWAY_REPLICAS_RETENTION` | `24h` | Replica rows not seen for this long are deleted. At least `10m`, the api's replica-limit window |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 
-Every duration above must be greater than zero, `SB_WORKER_GITOPS_BATCH_SIZE` at least 1, and the Gateway knobs at or above their floors. Anything else stops the worker at boot with an error naming the variable. The floors are checked even while the Gateway sweepers are off, so turning them on later can't surface a bad value.
+Every duration above must be greater than zero, and the Gateway knobs at or above their floors. Anything else stops the worker at boot with an error naming the variable. The floors are checked even while the Gateway sweepers are off, so turning them on later can't surface a bad value.
+
+### Retired settings
+
+The worker no longer talks to Argo CD. The Gateway is the only Secrets Bridge component that does (secrets-bridge/gateway#13), so the control-plane poller (`gitops-poller`, `gitops-timeout`) was removed. These settings are not read any more:
+
+`SB_WORKER_GITOPS_ENABLED`, `SB_WORKER_GITOPS_POLL_INTERVAL`, `SB_WORKER_GITOPS_TIMEOUT_INTERVAL`, `SB_WORKER_GITOPS_BATCH_SIZE`, `SB_WORKER_GITOPS_HTTP_TIMEOUT`.
+
+If one is still set, the worker logs its name (never the value) once at startup so you can remove it. No value turns the poller back on, and a value that used to be invalid no longer stops the boot. The worker also no longer needs KMS settings (`SB_KMS_*`) or KMS access: it only used them to unwrap stored Argo CD tokens. A test (`internal/archguard`) fails if any non-test file imports an Argo CD client or builds an Argo CD API path again.
 
 ### Gateway observation sweepers
 
@@ -111,8 +112,6 @@ Someone who signs in with Google for the first time gets an account that waits u
 - **Once each.** A cursor in Redis (`<ns>:cursor:users-pending`) remembers the newest account announced. It moves only after the webhook accepts the message, so a failed post is retried on the next run. With no cursor yet, the accounts already waiting are announced once. A cursor that can't be saved after a post ends the tick without a retry, so the message isn't sent twice in one tick; the next tick sends it once more.
 - **Slack escaping.** The Slack format escapes `&`, `<` and `>` in every message, so event text can't mention `@channel` or dress up a link. Emails also lose control and format characters before they go in.
 - Accounts younger than 30 seconds wait for the next run, so one whose transaction commits late can't slip behind the cursor.
-
-ArgoCD endpoints must use `https://`. Plain `http://` is only polled when `SB_ENV=dev`; otherwise the endpoint is skipped before its token is unwrapped and a health error is recorded on it.
 
 ## Discover targets
 
@@ -173,7 +172,7 @@ go run ./cmd/worker
 | Slice | Scope | Status |
 |---|---|---|
 | Step 11 ([#1](https://github.com/secrets-bridge/worker/issues/1)) | Scaffold + retry + notifications + scheduler + 5 sweepers (wraps-expired / secrets-stale / agents-stale / jobs-recovery / discover-scheduler) | ✅ merged |
-| BRD §26 GitOps poller ([#3](https://github.com/secrets-bridge/worker/pull/3)) | `gitops-poller` (15 s) + `gitops-timeout` (1 m) sweepers; opt-in via `SB_WORKER_GITOPS_ENABLED=true`, must match api's `SB_GITOPS_ENABLED` | ✅ merged |
+| BRD §26 GitOps poller ([#3](https://github.com/secrets-bridge/worker/pull/3)) | `gitops-poller` + `gitops-timeout`; removed at the Gateway R1 cutover ([gateway#13](https://github.com/secrets-bridge/gateway/issues/13)) | removed |
 | Gateway R1 ([#38](https://github.com/secrets-bridge/worker/issues/38)) | `observation-leases`, `observation-deadlines`, `gateways-stale`, `gateway-replicas-prune`; opt-in via `SB_WORKER_GATEWAY_SWEEPERS_ENABLED=true` | in review |
 
 See [`skills/PROGRESS.md`](https://github.com/secrets-bridge/skills/blob/main/PROGRESS.md) for the slice-by-slice log.

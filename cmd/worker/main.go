@@ -26,9 +26,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 
-	"github.com/google/uuid"
-
-	"github.com/secrets-bridge/api/pkg/keymgmt"
 	"github.com/secrets-bridge/api/pkg/runtime"
 	"github.com/secrets-bridge/api/pkg/storage"
 
@@ -70,6 +67,18 @@ func gatewaySweepersRetry() retry.Policy {
 	}
 }
 
+// logRetiredEnv notes the retired settings that are still set. The
+// control-plane Argo CD poller is gone: the Gateway is the only
+// component that talks to Argo CD, and nothing here turns the poller
+// back on. It logs the names only, never the values.
+func logRetiredEnv(logger *slog.Logger, set []string) {
+	if len(set) == 0 {
+		return
+	}
+	logger.Info("settings no longer used can be removed: the Argo CD poller was removed, the Gateway is the only Argo CD client",
+		"env", set)
+}
+
 func main() {
 	cfg, err := loadConfig()
 	if err != nil {
@@ -84,6 +93,7 @@ func main() {
 		"version", buildVersion,
 		"local_addr", cfg.LocalAddr,
 	)
+	logRetiredEnv(logger, cfg.RetiredEnvSet)
 
 	bootCtx, cancelBoot := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancelBoot()
@@ -236,60 +246,9 @@ func main() {
 		logger.Info("waiting-account messages off (set SB_WORKER_WEBHOOK_URL to send them)")
 	}
 
-	// GitOps observation poller (BRD §26). OFF by default — must be
-	// opt-in via SB_WORKER_GITOPS_ENABLED=true AND the api side must
-	// have SB_GITOPS_ENABLED=true. When disabled, the gitops_observations
-	// table is never read.
-	if cfg.GitOpsEnabled {
-		km, err := keymgmt.FromEnv(bootCtx, cfg.Env)
-		if err != nil {
-			logger.Error("gitops poller: KeyManager init failed", "error", err)
-			os.Exit(1)
-		}
-		obsRepo := sweepers.GitOpsObservationStore{
-			GitOpsObservations: storage.NewGitOpsObservations(pool),
-			DB:                 pool,
-		}
-		endpointRepo := storage.NewArgoCDEndpoints(pool)
-		sched.Register(scheduler.TaskRegistration{
-			Task: sweepers.GitOpsPoller{
-				Observations:  obsRepo,
-				Endpoints:     endpointRepo,
-				ResolveToken:  sweepers.BuildTokenResolver(km),
-				ClientFactory: sweepers.BuildArgoClient,
-				Notifier:      notifier,
-				Audit:         auditRepo,
-				BatchSize:     cfg.GitOpsBatchSize,
-				HTTPTimeout:   cfg.GitOpsHTTPTimeout,
-				ReplicaID:     uuid.New(),
-				// WRK-N-04: never send the ArgoCD token over plain http
-				// outside local dev.
-				AllowPlainHTTP: cfg.Env == ModeDev,
-			},
-			Interval: cfg.GitOpsPollInterval,
-			Retry:    retry.DefaultPolicy(),
-		})
-		sched.Register(scheduler.TaskRegistration{
-			Task: sweepers.GitOpsTimeoutSweeper{
-				Repo:     obsRepo,
-				Audit:    auditRepo,
-				Notifier: notifier,
-			},
-			Interval: cfg.GitOpsTimeoutInterval,
-			Retry:    retry.DefaultPolicy(),
-		})
-		logger.Info("gitops observation poller enabled (BRD §26)",
-			"poll_interval", cfg.GitOpsPollInterval,
-			"timeout_interval", cfg.GitOpsTimeoutInterval,
-			"batch_size", cfg.GitOpsBatchSize,
-			"kms_key_id", km.CurrentKeyID(),
-		)
-	} else {
-		logger.Info("gitops observation poller disabled (set SB_WORKER_GITOPS_ENABLED=true to enable)")
-	}
 	// Gateway observation sweepers (worker#38). OFF by default; turn on
-	// with SB_WORKER_GATEWAY_SWEEPERS_ENABLED=true together with the
-	// api's SB_GATEWAY_ENABLED.
+	// with SB_WORKER_GATEWAY_SWEEPERS_ENABLED=true whenever any
+	// environment's observation source is gateway.
 	if cfg.GatewaySweepersEnabled {
 		registerGatewaySweepers(sched, cfg, pool, auditRepo, notifier)
 		logger.Info("gateway observation sweepers enabled",
