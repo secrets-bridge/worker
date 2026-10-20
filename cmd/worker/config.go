@@ -15,10 +15,8 @@ import (
 // safe default — the worker boots with `docker compose up` and only
 // SB_DISCOVER_TARGETS_JSON / webhook URL need touching for
 // non-trivial setups.
-// Deployment mode. Mirrors the api repo's SB_ENV — production is the
-// safe default. Worker only consults it to forward into
-// keymgmt.FromEnv when the GitOps poller initializes its KeyManager;
-// the rest of the worker is unaffected by mode today.
+// Deployment mode. Mirrors the api repo's SB_ENV; production is the
+// safe default. The worker consults it for the SB_PUBLIC_URL rule only.
 const (
 	ModeDev        = "dev"
 	ModeProduction = "production"
@@ -29,9 +27,7 @@ type Config struct {
 	ShutdownGrace time.Duration
 
 	// Env is the deployment mode (SB_ENV). Recognised: "dev" or
-	// "production"; default "production" so a missing/forgotten env
-	// fails closed against LocalKMS in the api-shared keymgmt
-	// resolver.
+	// "production"; default "production".
 	Env string
 
 	// Sweep cadences. Defaults err on the side of "won't spam your
@@ -62,23 +58,15 @@ type Config struct {
 	// is used, as in the api.
 	PublicURL string
 
-	// GitOps observation poller (BRD §26). Opt-in via
-	// SB_WORKER_GITOPS_ENABLED=true so disabled deployments don't
-	// register the sweeper and don't even open the argocd_endpoints
-	// repo. When the api side has SB_GITOPS_ENABLED=false the worker
-	// MUST also be off — otherwise the poller would scan a table that
-	// will never receive rows.
-	GitOpsEnabled         bool
-	GitOpsPollInterval    time.Duration // default 15s during active rollout
-	GitOpsTimeoutInterval time.Duration // default 1m for the timeout sweeper
-	GitOpsBatchSize       int           // observations per tick; default 20
-	GitOpsHTTPTimeout     time.Duration // per-ArgoCD-call ceiling; default 15s
+	// RetiredEnvSet names the retired settings that are still set
+	// (retiredEnvSet). Names only, never values.
+	RetiredEnvSet []string
 
 	// Gateway observation sweepers (worker#38): observation-leases,
 	// observation-deadlines, gateways-stale and gateway-replicas-prune.
-	// Opt-in via SB_WORKER_GATEWAY_SWEEPERS_ENABLED=true, to be turned
-	// on with the api's SB_GATEWAY_ENABLED. Off, the gateway and
-	// observation tables are never touched.
+	// Opt-in via SB_WORKER_GATEWAY_SWEEPERS_ENABLED=true. Needed
+	// whenever any environment's observation source is gateway. Off,
+	// the gateway and observation tables are never touched.
 	GatewaySweepersEnabled       bool
 	ObservationLeasesInterval    time.Duration // default 30s
 	ObservationDeadlinesInterval time.Duration // default 30s
@@ -133,13 +121,9 @@ func loadConfig() (Config, error) {
 		CrossTeamFillExpiredInterval: 30 * time.Second,
 		// One message per run at most, so this is also the most often
 		// admins hear about new accounts.
-		UsersPendingInterval:  1 * time.Minute,
-		SecretsStaleAfter:     24 * time.Hour,
-		AgentsStaleAfter:      5 * time.Minute,
-		GitOpsPollInterval:    15 * time.Second,
-		GitOpsTimeoutInterval: 1 * time.Minute,
-		GitOpsBatchSize:       20,
-		GitOpsHTTPTimeout:     15 * time.Second,
+		UsersPendingInterval: 1 * time.Minute,
+		SecretsStaleAfter:    24 * time.Hour,
+		AgentsStaleAfter:     5 * time.Minute,
 
 		ObservationLeasesInterval:    30 * time.Second,
 		ObservationDeadlinesInterval: 30 * time.Second,
@@ -176,9 +160,6 @@ func loadConfig() (Config, error) {
 		{"SB_WORKER_USERS_PENDING_INTERVAL", &cfg.UsersPendingInterval},
 		{"SB_WORKER_SECRETS_STALE_AFTER", &cfg.SecretsStaleAfter},
 		{"SB_WORKER_AGENTS_STALE_AFTER", &cfg.AgentsStaleAfter},
-		{"SB_WORKER_GITOPS_POLL_INTERVAL", &cfg.GitOpsPollInterval},
-		{"SB_WORKER_GITOPS_TIMEOUT_INTERVAL", &cfg.GitOpsTimeoutInterval},
-		{"SB_WORKER_GITOPS_HTTP_TIMEOUT", &cfg.GitOpsHTTPTimeout},
 		{"SB_WORKER_OBSERVATION_LEASES_INTERVAL", &cfg.ObservationLeasesInterval},
 		{"SB_WORKER_OBSERVATION_DEADLINES_INTERVAL", &cfg.ObservationDeadlinesInterval},
 		{"SB_WORKER_GATEWAYS_STALE_INTERVAL", &cfg.GatewaysStaleInterval},
@@ -210,20 +191,6 @@ func loadConfig() (Config, error) {
 		}
 		cfg.PublicURL = u
 	}
-	if v := os.Getenv("SB_WORKER_GITOPS_ENABLED"); v != "" {
-		b, err := strconv.ParseBool(v)
-		if err != nil {
-			return Config{}, fmt.Errorf("config: SB_WORKER_GITOPS_ENABLED: %w", err)
-		}
-		cfg.GitOpsEnabled = b
-	}
-	if v := os.Getenv("SB_WORKER_GITOPS_BATCH_SIZE"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			return Config{}, fmt.Errorf("config: SB_WORKER_GITOPS_BATCH_SIZE: %w", err)
-		}
-		cfg.GitOpsBatchSize = n
-	}
 	if v := os.Getenv("SB_WORKER_GATEWAY_SWEEPERS_ENABLED"); v != "" {
 		b, err := strconv.ParseBool(v)
 		if err != nil {
@@ -238,10 +205,36 @@ func loadConfig() (Config, error) {
 		}
 		cfg.ObservationBatchSize = n
 	}
+	cfg.RetiredEnvSet = retiredEnvSet()
 	if err := cfg.validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// retiredEnv are settings the worker no longer reads. They configured
+// the control-plane Argo CD poller, removed when the Gateway became the
+// only component that talks to Argo CD (secrets-bridge/gateway#13).
+// Setting one does nothing: there is no switch to turn the poller back
+// on.
+var retiredEnv = []string{
+	"SB_WORKER_GITOPS_ENABLED",
+	"SB_WORKER_GITOPS_POLL_INTERVAL",
+	"SB_WORKER_GITOPS_TIMEOUT_INTERVAL",
+	"SB_WORKER_GITOPS_BATCH_SIZE",
+	"SB_WORKER_GITOPS_HTTP_TIMEOUT",
+}
+
+// retiredEnvSet returns the names of the retiredEnv entries that are
+// set to a non-empty value. It never returns or reads out the values.
+func retiredEnvSet() []string {
+	var set []string
+	for _, k := range retiredEnv {
+		if v, ok := os.LookupEnv(k); ok && v != "" {
+			set = append(set, k)
+		}
+	}
+	return set
 }
 
 // normalizePublicURL is the api's rule for SB_PUBLIC_URL
@@ -276,9 +269,9 @@ const minUsersPendingInterval = 30 * time.Second
 // validate rejects values that would break the worker after it already
 // reported ready: time.NewTicker panics on a non-positive interval, a
 // non-positive *_STALE_AFTER moves the cutoff to now or later (every
-// row goes stale), and a negative HTTP timeout means no timeout.
-// Checked for every knob, including GitOps ones while GitOps is off, so
-// flipping SB_WORKER_GITOPS_ENABLED later can't surface a latent bad
+// row goes stale).
+// Checked for every knob, including the Gateway ones while those
+// sweepers are off, so turning them on later can't surface a latent bad
 // value. WRK-N-06.
 func (c Config) validate() error {
 	for _, d := range []struct {
@@ -296,9 +289,6 @@ func (c Config) validate() error {
 		{"SB_WORKER_USERS_PENDING_INTERVAL", c.UsersPendingInterval},
 		{"SB_WORKER_SECRETS_STALE_AFTER", c.SecretsStaleAfter},
 		{"SB_WORKER_AGENTS_STALE_AFTER", c.AgentsStaleAfter},
-		{"SB_WORKER_GITOPS_POLL_INTERVAL", c.GitOpsPollInterval},
-		{"SB_WORKER_GITOPS_TIMEOUT_INTERVAL", c.GitOpsTimeoutInterval},
-		{"SB_WORKER_GITOPS_HTTP_TIMEOUT", c.GitOpsHTTPTimeout},
 		{"SB_WORKER_OBSERVATION_LEASES_INTERVAL", c.ObservationLeasesInterval},
 		{"SB_WORKER_OBSERVATION_DEADLINES_INTERVAL", c.ObservationDeadlinesInterval},
 		{"SB_WORKER_GATEWAYS_STALE_INTERVAL", c.GatewaysStaleInterval},
@@ -330,9 +320,6 @@ func (c Config) validate() error {
 	}
 	if c.ObservationBatchSize < 1 || c.ObservationBatchSize > maxObservationBatchSize {
 		return fmt.Errorf("config: SB_WORKER_OBSERVATION_BATCH_SIZE must be between 1 and %d (got %d)", maxObservationBatchSize, c.ObservationBatchSize)
-	}
-	if c.GitOpsBatchSize < 1 {
-		return fmt.Errorf("config: SB_WORKER_GITOPS_BATCH_SIZE must be at least 1 (got %d)", c.GitOpsBatchSize)
 	}
 	return nil
 }

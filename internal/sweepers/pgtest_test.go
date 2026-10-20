@@ -48,8 +48,6 @@ func testPool(t *testing.T) *storage.Pool {
 			gateways,
 			reveal_sessions,
 			secret_wraps,
-			gitops_observations,
-			argocd_endpoints,
 			sync_runs,
 			sync_jobs,
 			approvals,

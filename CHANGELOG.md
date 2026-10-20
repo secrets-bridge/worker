@@ -11,6 +11,15 @@ on `main`.
 
 ## [Unreleased]
 
+### Removed
+- The control-plane Argo CD poller (`gitops-poller`, `gitops-timeout`
+  and their store). The Gateway is the only component that talks to
+  Argo CD (secrets-bridge/gateway#13). `SB_WORKER_GITOPS_ENABLED`,
+  `SB_WORKER_GITOPS_POLL_INTERVAL`, `SB_WORKER_GITOPS_TIMEOUT_INTERVAL`,
+  `SB_WORKER_GITOPS_BATCH_SIZE` and `SB_WORKER_GITOPS_HTTP_TIMEOUT` are
+  retired: logged by name at startup if set, never read. The worker no
+  longer needs KMS settings or access.
+
 ### Security
 - gitops-poller no longer stores ArgoCD `message` / `health_message`
   free text in `observed_state` (WRK-01).
@@ -28,6 +37,8 @@ on `main`.
 - Failed notifications are logged and counted (WRK-N-07).
 
 ### Added
+- `internal/archguard`: fails if non-test code imports an Argo CD
+  client or builds an Argo CD API path.
 - Docker image publishing workflow — multi-arch (amd64 + arm64),
   pushed to `ghcr.io/secrets-bridge/worker`. Tags: rolling `dev` on
   every push to `main`; semver tags + `latest` activate post-`v0.1.0`.

@@ -5,13 +5,11 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/secrets-bridge/api/pkg/argocd"
 	"github.com/secrets-bridge/api/pkg/storage"
 	"github.com/secrets-bridge/worker/internal/sweepers"
 )
@@ -31,16 +29,6 @@ func (r *recordingAudit) Append(_ context.Context, evt *storage.AuditEvent) erro
 	}
 	r.events = append(r.events, *evt)
 	return nil
-}
-
-func (r *recordingAudit) actions() []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]string, len(r.events))
-	for i, e := range r.events {
-		out[i] = e.Action
-	}
-	return out
 }
 
 func auditFailureCount(t *testing.T, reg *prometheus.Registry, sweeper string) float64 {
@@ -123,45 +111,5 @@ func TestAudit_MissingSinkIsLoud(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "no audit sink wired") {
 		t.Fatalf("missing-sink log line absent:\n%s", logs.String())
-	}
-}
-
-// The poller and the timeout sweeper can race on one row. Whoever loses
-// (TransitionTerminal reports no change) writes no audit event.
-func TestAudit_GitOpsLostRaceIsNotAudited(t *testing.T) {
-	endpointID := uuid.New()
-	obs := &fakeGitOpsObsRepo{
-		alreadyTerminal: true,
-		claim:           []*storage.GitOpsObservation{{ID: uuid.New(), RequestID: uuid.New(), ArgoCDEndpointID: endpointID, ApplicationName: "x"}},
-		findRows:        []*storage.GitOpsObservation{{ID: uuid.New(), RequestID: uuid.New(), ApplicationName: "y"}},
-	}
-	audit := &recordingAudit{}
-	notif := &recordingNotifier{}
-	poller := sweepers.GitOpsPoller{
-		Observations: obs,
-		Endpoints: &fakeEndpointRepo{endpoint: &storage.ArgoCDEndpoint{
-			ID: endpointID, BaseURL: "https://argocd.example.com", Enabled: true,
-		}},
-		ResolveToken: stubToken,
-		ClientFactory: func(context.Context, *storage.ArgoCDEndpoint, []byte, time.Duration) (sweepers.ArgoClient, error) {
-			return &fakeArgoClient{app: &argocd.Application{HealthStatus: "Healthy", SyncStatus: "Synced"}}, nil
-		},
-		Audit: audit,
-	}
-	if err := poller.Run(t.Context()); err != nil {
-		t.Fatalf("poller Run: %v", err)
-	}
-	timeout := sweepers.GitOpsTimeoutSweeper{Repo: obs, Audit: audit, Notifier: notif}
-	if err := timeout.Run(t.Context()); err != nil {
-		t.Fatalf("timeout Run: %v", err)
-	}
-	if len(obs.transitions) != 2 {
-		t.Fatalf("transitions attempted = %d want 2", len(obs.transitions))
-	}
-	if a := audit.actions(); len(a) != 0 {
-		t.Fatalf("audited %v for transitions that changed nothing", a)
-	}
-	if len(notif.events) != 0 {
-		t.Fatalf("timeout sweeper notified %d flip(s) that didn't happen", len(notif.events))
 	}
 }

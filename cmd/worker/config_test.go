@@ -19,9 +19,6 @@ var durationVars = []string{
 	"SB_WORKER_USERS_PENDING_INTERVAL",
 	"SB_WORKER_SECRETS_STALE_AFTER",
 	"SB_WORKER_AGENTS_STALE_AFTER",
-	"SB_WORKER_GITOPS_POLL_INTERVAL",
-	"SB_WORKER_GITOPS_TIMEOUT_INTERVAL",
-	"SB_WORKER_GITOPS_HTTP_TIMEOUT",
 	"SB_WORKER_OBSERVATION_LEASES_INTERVAL",
 	"SB_WORKER_OBSERVATION_DEADLINES_INTERVAL",
 	"SB_WORKER_GATEWAYS_STALE_INTERVAL",
@@ -54,13 +51,12 @@ func TestLoadConfig_PositiveOverridesAccepted(t *testing.T) {
 		}
 		t.Setenv(name, "90s")
 	}
-	t.Setenv("SB_WORKER_GITOPS_BATCH_SIZE", "5")
 	t.Setenv("SB_WORKER_OBSERVATION_BATCH_SIZE", "50")
 	cfg, err := loadConfig()
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
-	if cfg.AgentsStaleAfter != 90*time.Second || cfg.GitOpsHTTPTimeout != 90*time.Second || cfg.GitOpsBatchSize != 5 ||
+	if cfg.AgentsStaleAfter != 90*time.Second ||
 		cfg.GatewaysStaleAfter != 90*time.Second || cfg.GatewayReplicasRetention != 15*time.Minute || cfg.ObservationBatchSize != 50 {
 		t.Fatalf("overrides not applied: %+v", cfg)
 	}
@@ -68,9 +64,8 @@ func TestLoadConfig_PositiveOverridesAccepted(t *testing.T) {
 
 // WRK-N-06: a zero or negative interval panics time.NewTicker after the
 // worker already reported ready, a negative *_STALE_AFTER puts the
-// cutoff in the future (every row goes stale), and a negative HTTP
-// timeout disables the timeout. All of them must stop the boot with a
-// message naming the variable.
+// cutoff in the future (every row goes stale). All of them must stop
+// the boot with a message naming the variable.
 func TestLoadConfig_RejectsNonPositiveDurations(t *testing.T) {
 	for _, name := range durationVars {
 		for _, bad := range []string{"0s", "-1s", "-24h"} {
@@ -85,18 +80,6 @@ func TestLoadConfig_RejectsNonPositiveDurations(t *testing.T) {
 				}
 			})
 		}
-	}
-}
-
-func TestLoadConfig_RejectsNonPositiveBatchSize(t *testing.T) {
-	for _, bad := range []string{"0", "-5"} {
-		t.Run(bad, func(t *testing.T) {
-			t.Setenv("SB_WORKER_GITOPS_BATCH_SIZE", bad)
-			_, err := loadConfig()
-			if err == nil || !strings.Contains(err.Error(), "SB_WORKER_GITOPS_BATCH_SIZE") {
-				t.Fatalf("err = %v want a SB_WORKER_GITOPS_BATCH_SIZE bounds error", err)
-			}
-		})
 	}
 }
 
