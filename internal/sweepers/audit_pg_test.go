@@ -277,10 +277,15 @@ func TestAudit_PG_AgentsStale(t *testing.T) {
 	pool := testPool(t)
 	ctx := t.Context()
 	var quiet, fresh uuid.UUID
-	if err := pool.QueryRow(ctx, `INSERT INTO agents (name, status, secret_hash, last_seen_at) VALUES ('agent-name-canary', 'active', '\x00', now() - interval '1 hour') RETURNING id`).Scan(&quiet); err != nil {
+	// Every non-revoked agent carries an x25519 key with a matching
+	// fingerprint (api migration 0051).
+	const insertAgent = `INSERT INTO agents (name, status, secret_hash, last_seen_at, public_key, public_key_algorithm, public_key_fingerprint)
+		SELECT $1, 'active', '\x00', $2::timestamptz, k, 'x25519', 'sha256:' || encode(sha256(k), 'hex')
+		FROM (SELECT decode(repeat('ab', 32), 'hex') AS k) key RETURNING id`
+	if err := pool.QueryRow(ctx, insertAgent, "agent-name-canary", time.Now().Add(-time.Hour)).Scan(&quiet); err != nil {
 		t.Fatalf("agent insert: %v", err)
 	}
-	if err := pool.QueryRow(ctx, `INSERT INTO agents (name, status, secret_hash, last_seen_at) VALUES ('agent-fresh', 'active', '\x00', now()) RETURNING id`).Scan(&fresh); err != nil {
+	if err := pool.QueryRow(ctx, insertAgent, "agent-fresh", time.Now()).Scan(&fresh); err != nil {
 		t.Fatalf("agent insert: %v", err)
 	}
 
