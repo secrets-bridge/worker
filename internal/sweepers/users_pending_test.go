@@ -227,7 +227,7 @@ func TestUsersPending_LinkToAdminUsers(t *testing.T) {
 	}
 
 	ev := run("")
-	if !strings.HasSuffix(ev.Detail, "Approve or decline them in the console, under Admin → Users.") || ev.Metadata["link"] != nil {
+	if !strings.HasSuffix(ev.Detail, "Approve or decline them in the console, under Administration → Accounts.") || ev.Metadata["link"] != nil {
 		t.Errorf("no address: %q %v", ev.Detail, ev.Metadata)
 	}
 
@@ -235,7 +235,7 @@ func TestUsersPending_LinkToAdminUsers(t *testing.T) {
 		t.Fatal(err)
 	}
 	ev = run("")
-	if !strings.HasSuffix(ev.Detail, "Admin → Users: https://console.example.com/admin/users") || ev.Metadata["link"] != "https://console.example.com/admin/users" {
+	if !strings.HasSuffix(ev.Detail, "Administration → Accounts: https://console.example.com/admin/users") || ev.Metadata["link"] != "https://console.example.com/admin/users" {
 		t.Errorf("console address: %q %v", ev.Detail, ev.Metadata)
 	}
 
@@ -275,7 +275,7 @@ func TestUsersPending_NoDisplayNames(t *testing.T) {
 	runPending(t, sweepers.UsersPending{Pool: pool, Cursor: &memCursor{}, Notifier: webhook})
 
 	want := "[info] 3 new accounts are waiting for approval\n• eve@example.com\n• mal@example.com\n• odd@example.com\n" +
-		"Approve or decline them in Admin → Users: https://secrets.example.com/admin/users"
+		"Approve or decline them in Administration → Accounts: https://secrets.example.com/admin/users"
 	if body != want {
 		t.Errorf("slack text = %q, want %q", body, want)
 	}
@@ -318,7 +318,7 @@ func TestUsersPending_MissingSettingsRow(t *testing.T) {
 	addAccounts(t, pool, account{email: "sara@example.com", age: time.Hour})
 	sink := &webhookSink{}
 	runPending(t, sweepers.UsersPending{Pool: pool, Cursor: &memCursor{}, Notifier: sink})
-	if len(sink.events) != 1 || !strings.HasSuffix(sink.events[0].Detail, "under Admin → Users.") {
+	if len(sink.events) != 1 || !strings.HasSuffix(sink.events[0].Detail, "under Administration → Accounts.") {
 		t.Fatalf("got %+v", sink.events)
 	}
 }
