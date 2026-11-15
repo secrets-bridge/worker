@@ -22,10 +22,10 @@ import (
 // UsersPending tells the admins when accounts start waiting for
 // approval (worker#34). Someone who signs in with Google for the first
 // time gets an account that can't do anything until an admin approves
-// it on Admin → Users (api#265). Each run posts at most one message:
+// it on Administration → Accounts (api#265). Each run posts at most one message:
 // the accounts that started waiting since the last message, up to
 // UsersPendingListMax by email, then "and N more", and a link to
-// Admin → Users built from the install's public address.
+// Administration → Accounts built from the install's public address.
 //
 // Emails only, never display names. A display name comes from the
 // person's Google account and can be anything, and Slack turns
@@ -168,10 +168,10 @@ func usersPendingEvent(emails []string, fresh, waiting int64, publicURL string) 
 	meta := map[string]any{"new": fresh, "waiting": waiting}
 	if publicURL != "" {
 		link := publicURL + "/admin/users"
-		fmt.Fprintf(&b, "Approve or decline them in Admin → Users: %s", link)
+		fmt.Fprintf(&b, "Approve or decline them in Administration → Accounts: %s", link)
 		meta["link"] = link
 	} else {
-		b.WriteString("Approve or decline them in the console, under Admin → Users.")
+		b.WriteString("Approve or decline them in the console, under Administration → Accounts.")
 	}
 	return notifications.Event{
 		Severity:  notifications.SeverityInfo,

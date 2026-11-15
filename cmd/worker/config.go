@@ -54,7 +54,7 @@ type Config struct {
 
 	// PublicURL is SB_PUBLIC_URL, the address people open the console
 	// with, without a trailing slash. The users-pending message links
-	// to Admin → Users with it. Unset, the address saved in the console
+	// to Administration → Accounts with it. Unset, the address saved in the console
 	// is used, as in the api.
 	PublicURL string
 

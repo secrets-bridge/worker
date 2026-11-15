@@ -105,7 +105,7 @@ The task sweeps lock task rows only (`FOR UPDATE SKIP LOCKED`). The Gateway swee
 
 ### Accounts waiting for approval
 
-Someone who signs in with Google for the first time gets an account that waits until an admin approves it on Admin → Users. `users-pending` tells the admins: each run posts at most one message to the webhook with the accounts that started waiting since the last one, up to 10 by email, then "and N more", and a link to `<public address>/admin/users`.
+Someone who signs in with Google for the first time gets an account that waits until an admin approves it on Administration → Accounts. `users-pending` tells the admins: each run posts at most one message to the webhook with the accounts that started waiting since the last one, up to 10 by email, then "and N more", and a link to `<public address>/admin/users`.
 
 - **Emails, never display names.** A display name comes from the person's Google account and can be anything, and Slack turns URL-shaped text into links and reads `*`, `_` and `~` as formatting. An email had to pass Google's `hd` check and the allowed domains.
 - **Webhook only.** The message still names people, so it never goes to the log: the worker logs the counts. Without `SB_WORKER_WEBHOOK_URL` the sweeper isn't registered, and the console's badge and Overview banner show who is waiting.
